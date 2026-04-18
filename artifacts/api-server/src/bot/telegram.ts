@@ -27,7 +27,10 @@ import {
   addGroupParticipantsBulk,
   isUserInGroup,
   getConnectedWhatsAppNumber,
-  getSession,
+  sendGroupMessage,
+  getAutoUserId,
+  isAutoConnected,
+  getAutoConnectedNumber,
 } from "./whatsapp";
 import { parseVCF, normalizePhone } from "./vcf-parser";
 import QRCode from "qrcode";
@@ -132,14 +135,25 @@ function esc(text: string): string {
 }
 
 function connectedStatusText(userId: number): string {
-  if (!isConnected(String(userId))) {
-    return "📱 <b>Status:</b> WhatsApp not connected\n";
+  const mainConnected = isConnected(String(userId));
+  const autoConnected = isAutoConnected(String(userId));
+  let text = "";
+
+  if (!mainConnected) {
+    text += "📱 <b>Status:</b> WhatsApp not connected\n";
+  } else {
+    const number = getConnectedWhatsAppNumber(String(userId));
+    text += "✅ <b>Status:</b> WhatsApp connected\n" +
+      (number ? `📞 <b>Connected Number:</b> <code>${esc(number)}</code>\n` : "📞 <b>Connected Number:</b> Detecting from session\n");
   }
-  const number = getConnectedWhatsAppNumber(String(userId));
-  return (
-    "✅ <b>Status:</b> WhatsApp connected\n" +
-    (number ? `📞 <b>Connected Number:</b> <code>${esc(number)}</code>\n` : "📞 <b>Connected Number:</b> Detecting from session\n")
-  );
+
+  if (autoConnected) {
+    const autoNumber = getAutoConnectedNumber(String(userId));
+    text += "🤖 <b>Auto Chat WA:</b> Connected\n" +
+      (autoNumber ? `📞 <b>Auto Number:</b> <code>${esc(autoNumber)}</code>\n` : "");
+  }
+
+  return text;
 }
 
 function mainMenuText(userId: number, mode: "welcome" | "menu" = "menu"): string {
@@ -398,8 +412,32 @@ interface UserState {
     message: string;
     users: number[];
   };
+  chatInGroupData?: {
+    allGroups: Array<{ id: string; subject: string }>;
+    selectedIndices: Set<number>;
+    page: number;
+    message: string;
+    delaySeconds: number;
+    cancelled: boolean;
+  };
+  autoConnectStep?: string;
 }
 
+interface AutoChatSession {
+  running: boolean;
+  cancelled: boolean;
+  chatId: number;
+  msgId: number;
+  groups: Array<{ id: string; subject: string }>;
+  message: string;
+  delaySeconds: number;
+  repeatCount: number;
+  sent: number;
+  failed: number;
+  currentRound: number;
+}
+
+const autoChatSessions: Map<number, AutoChatSession> = new Map();
 const userStates: Map<number, UserState> = new Map();
 const joinCancelRequests: Set<number> = new Set();
 const getLinkCancelRequests: Set<number> = new Set();
@@ -474,10 +512,10 @@ function qrExpiredKeyboard(): InlineKeyboard {
 function qrCaption(remainingSeconds: number): string {
   return (
     "📷 <b>Pair WhatsApp with QR</b>\n\n" +
-    "1️⃣ Open WhatsApp\n" +
+    "1️⃣ WhatsApp open karo\n" +
     "2️⃣ Settings → Linked Devices\n" +
-    "3️⃣ Tap Link a Device\n" +
-    "4️⃣ Scan this QR code\n\n" +
+    "3️⃣ Link a Device tap karo\n" +
+    "4️⃣ Ye QR scan karo\n\n" +
     `⏳ QR expires in: <b>${remainingSeconds}s</b>`
   );
 }
@@ -610,6 +648,7 @@ async function startQrPairing(ctx: any, userId: number): Promise<void> {
 
 function mainMenu(userId?: number): InlineKeyboard {
   const connected = userId !== undefined && isConnected(String(userId));
+  const autoConnected = userId !== undefined && isAutoConnected(String(userId));
   const kb = new InlineKeyboard();
   if (!connected) {
     kb.text("📱 Connect WhatsApp", "connect_wa").row();
@@ -620,8 +659,13 @@ function mainMenu(userId?: number): InlineKeyboard {
     .text("🚪 Leave Group", "leave_group").text("🗑️ Remove Members", "remove_members").row()
     .text("👑 Make Admin", "make_admin").text("✅ Approval", "approval").row()
     .text("📋 Get Pending List", "pending_list").text("➕ Add Members", "add_members").row()
-    .text("💬 Auto Chat", "auto_chat").row()
-    .text("🔌 Disconnect", "disconnect_wa");
+    .text("💬 Chat In Group", "chat_in_group").row();
+  if (!autoConnected) {
+    kb.text("🤖 Connect Auto Chat WA", "connect_auto_wa").row();
+  } else {
+    kb.text("🤖 Auto Chat", "auto_chat_menu").row();
+  }
+  kb.text("🔌 Disconnect", "disconnect_wa");
   return kb;
 }
 
@@ -682,90 +726,81 @@ bot.command("help", async (ctx) => {
     `📌 All Features:\n\n` +
 
     `📱 1. Connect WhatsApp\n` +
-    `• Link your WhatsApp account with the bot\n` +
-    `• Send your phone number to receive an 8-digit pairing code\n` +
-    `• Enter the code in WhatsApp → Linked Devices\n` +
-    `• Once connected, all features become available\n\n` +
+    `• Bot se apna WhatsApp link karo\n` +
+    `• Phone number do → 8-digit pairing code milega\n` +
+    `• WhatsApp → Linked Devices mein code daalo\n` +
+    `• Ek baar connect hone ke baad sab features use karo\n\n` +
 
     `🏗️ 2. Create Groups\n` +
-    `• Create multiple WhatsApp groups at once\n` +
-    `• Use custom or auto-numbered group names\n` +
-    `• Set group description and display picture\n` +
-    `• Configure who can send messages or add members\n` +
-    `• Turn approval mode ON or OFF\n` +
-    `• Watch live creation progress\n\n` +
+    `• Ek saath kaafi saare WhatsApp groups banao\n` +
+    `• Custom ya auto-numbered names (e.g. Group 1, Group 2...)\n` +
+    `• Group description aur DP (icon) set kar sakte ho\n` +
+    `• Permissions: kaun message, kaun add kar sakta hai\n` +
+    `• Approval mode ON/OFF kar sakte ho\n` +
+    `• Live progress dikhta hai jaise groups bante hain\n\n` +
 
     `🔗 3. Get Group Links\n` +
-    `• Get invite links for your WhatsApp groups\n` +
-    `• Filter all groups or similar-name groups\n` +
-    `• Copy links and paste them anywhere\n\n` +
+    `• Apne sabhi WhatsApp groups ke invite links lo\n` +
+    `• Sabhi ya similar name ke groups filter karke\n` +
+    `• Links copy karke kahin bhi paste kar sakte ho\n\n` +
 
     `🔗 4. Join Groups\n` +
-    `• Paste multiple invite links\n` +
-    `• The bot joins every valid group automatically\n` +
-    `• Live progress is shown\n\n` +
+    `• Multiple invite links paste karo\n` +
+    `• Bot automatically sabhi groups join kar leta hai\n` +
+    `• Live progress dikhta hai\n\n` +
 
     `🚪 5. Leave Groups\n` +
-    `• Leave member-only groups, admin groups, or all groups\n` +
-    `• Batch leave similar-name groups\n\n` +
+    `• Sirf member wale, sirf admin wale, ya sabhi ek saath\n` +
+    `• Similar name wale groups batch mein leave\n\n` +
 
     `📊 6. CTC Checker\n` +
-    `• Send group links and VCF files to check contacts:\n` +
-    `  ✅ Already in group\n` +
-    `  ⏳ Pending approval\n` +
-    `  ❌ Not found in group\n` +
-    `  ⚠️ Wrong add — in group but not in VCF\n` +
-    `  🔁 Duplicate pending across multiple groups\n` +
-    `• Multiple VCF files are supported\n\n` +
+    `• Group links do → VCF files do → bot check karta hai:\n` +
+    `  ✅ Pehle se group mein hai\n` +
+    `  ⏳ Pending approval mein hai\n` +
+    `  ❌ Group mein nahi mila\n` +
+    `  ⚠️ Wrong add — group mein hai par VCF mein nahi\n` +
+    `  🔁 Duplicate pending — ek contact multiple groups mein\n` +
+    `• Multiple VCF files ek saath bhej sakte ho\n\n` +
 
     `🗑️ 7. Remove Members\n` +
-    `• Select one or more groups\n` +
-    `• Optionally exclude specific numbers\n` +
-    `• Remaining non-admin members are removed\n\n` +
+    `• Ek ya zyada groups select karo\n` +
+    `• Optionally kuch numbers exclude karo\n` +
+    `• Baki sabhi non-admin members remove ho jayenge\n\n` +
 
     `👑 8. Make Admin\n` +
-    `• Select admin groups\n` +
-    `• Send phone numbers\n` +
-    `• The bot finds and promotes them to admin\n\n` +
+    `• Admin groups select karo\n` +
+    `• Phone numbers bhejo\n` +
+    `• Bot dhundhke unhe admin promote kar dega\n\n` +
 
     `✅ 9. Approval\n` +
-    `• Select admin groups and approve pending members:\n` +
-    `  ☝️ 1 by 1: approve each pending member individually\n` +
-    `  👥 Together: approval OFF then ON to approve all at once\n` +
-    `• Similar-name groups can be selected together\n\n` +
+    `• Admin groups select karo → pending members approve karo:\n` +
+    `  ☝️ 1 by 1: Har pending member individually approve\n` +
+    `  👥 Together: Approval OFF phir ON — sabhi ek saath approve\n` +
+    `• Similar name wale groups ek saath select kar sakte ho\n\n` +
 
     `📋 10. Get Pending List\n` +
-    `• Shows pending member counts for admin groups\n` +
-    `• Groups similar names together\n` +
-    `• Helps you see pending counts per group\n\n` +
+    `• Sabhi admin groups ka pending members count dikhata hai\n` +
+    `• Similar name wale groups grouped dikhate hain\n` +
+    `• Pata chal jata hai kaun se group mein kitne log pending\n\n` +
 
     `➕ 11. Add Members\n` +
-    `• Send group link, friend numbers, and Admin/Navy/Member VCF files\n` +
-    `• Choose how many members to add\n` +
-    `• Add 1 by 1 with delay or add together quickly\n` +
-    `• Live progress is shown\n` +
-    `• Invite and cancel errors are skipped automatically\n` +
-    `• You can cancel while it is running\n\n` +
-
-    `💬 12. Auto Chat\n` +
-    `• Connect a second WhatsApp account for rotation\n` +
-    `• After the second account connects, the connect button is hidden and live status is shown\n` +
-    `• Chat with Friend rotates between both accounts\n` +
-    `• Chat in Group supports multiple selected groups\n` +
-    `• Group rotation sends Account 1 then Account 2 in the same group, then moves to the next group\n` +
-    `• Delay rotates randomly: 30 seconds, 1 minute, 5 minutes, 10 minutes, 20 minutes, 30 minutes, or 1 hour\n` +
-    `• Live sent count and Stop button are shown while running\n\n` +
+    `• Group link do → Friend numbers do → Admin/Navy/Member VCF do\n` +
+    `• Total kitna add karna hai batao\n` +
+    `• Add 1 by 1 (safe, with delay) ya Add Together (fast, ek baar mein)\n` +
+    `• Live progress dikhta hai\n` +
+    `• Invite/Cancel errors automatic skip hote hain\n` +
+    `• Beech mein cancel kar sakte ho\n\n` +
 
     `━━━━━━━━━━━━━━━━━━\n\n` +
     `💬 Commands:\n` +
-    `/start — Start the bot and open the main menu\n` +
-    `/help  — Show this help message\n\n` +
+    `/start — Bot start karo & main menu dekho\n` +
+    `/help  — Yeh help message dekho\n\n` +
 
     `━━━━━━━━━━━━━━━━━━\n\n` +
     `⚠️ Important Notes:\n` +
-    `• You must be a group admin for CTC pending checks\n` +
-    `• The group must have approval required mode enabled\n` +
-    `• 1 by 1 approval also requires admin permission`;
+    `• CTC Pending ke liye aap group admin hone chahiye\n` +
+    `• Group mein "Approval required" mode ON hona chahiye\n` +
+    `• 1 by 1 Approval ke liye bhi admin hona zaroori hai`;
 
   const helpText =
     `👤 <b>Owner:</b> ${OWNER_USERNAME}\n\n` +
@@ -2352,29 +2387,6 @@ bot.callbackQuery("rm_skip_exclude", async (ctx) => {
   const state = userStates.get(userId);
   if (!state?.removeExcludeData) return;
 
-  const selectedGroups = state.removeExcludeData.selectedGroups;
-  const groupList = selectedGroups.map(g => `• ${esc(g.subject)}`).join("\n");
-  await ctx.editMessageText(
-    `⚠️ <b>Confirm Remove Members</b>\n\n` +
-    `You are about to remove ALL non-admin members from <b>${selectedGroups.length} group(s):</b>\n\n` +
-    `${groupList}\n\n` +
-    `<b>No numbers will be excluded.</b>\n\n` +
-    `Are you sure?`,
-    {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard()
-        .text("✅ Yes, Remove All", "rm_confirm_no_exclude")
-        .text("❌ Cancel", "main_menu"),
-    }
-  );
-});
-
-bot.callbackQuery("rm_confirm_no_exclude", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  const state = userStates.get(userId);
-  if (!state?.removeExcludeData) return;
-
   await startRemoveMembersProcess(ctx, userId, state.removeExcludeData.selectedGroups, new Set());
 });
 
@@ -3297,6 +3309,611 @@ bot.callbackQuery("disconnect_confirm", async (ctx) => {
   });
 });
 
+// ─── Connect Auto Chat WhatsApp ───────────────────────────────────────────────
+
+bot.callbackQuery("connect_auto_wa", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!(await checkAccessMiddleware(ctx))) return;
+
+  if (isAutoConnected(String(userId))) {
+    await ctx.editMessageText(
+      "✅ <b>Auto Chat WhatsApp already connected!</b>\n\n" + connectedStatusText(userId),
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+    );
+    return;
+  }
+
+  userStates.set(userId, { step: "auto_connect_phone", autoConnectStep: "phone" });
+  await ctx.editMessageText(
+    "🤖 <b>Connect Auto Chat WhatsApp</b>\n\n" +
+    "Yeh alag WhatsApp number Auto Chat ke liye connect hoga.\n\n" +
+    "📱 Apna phone number bhejo (country code ke saath):\n" +
+    "Example: <code>919876543210</code>",
+    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("❌ Cancel", "main_menu") }
+  );
+});
+
+// ─── Auto Chat Menu ───────────────────────────────────────────────────────────
+
+bot.callbackQuery("auto_chat_menu", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!(await checkAccessMiddleware(ctx))) return;
+
+  if (!isAutoConnected(String(userId))) {
+    await ctx.editMessageText(
+      "❌ <b>Auto Chat WhatsApp not connected!</b>\n\nPehle Auto Chat WA connect karo.",
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🤖 Connect Auto WA", "connect_auto_wa").text("🏠 Menu", "main_menu") }
+    );
+    return;
+  }
+
+  const session = autoChatSessions.get(userId);
+  if (session?.running) {
+    const progressText = autoChatProgressText(session);
+    await ctx.editMessageText(progressText, {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("🔄 Refresh", "auto_chat_refresh")
+        .text("⏹️ Stop", "auto_chat_stop").row()
+        .text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+
+  const autoNumber = getAutoConnectedNumber(String(userId));
+  await ctx.editMessageText(
+    "🤖 <b>Auto Chat Menu</b>\n\n" +
+    (autoNumber ? `📞 Auto WA: <code>${esc(autoNumber)}</code>\n\n` : "") +
+    "Kya karna chahte ho?",
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("💬 Start Auto Chat", "auto_chat_start").row()
+        .text("🔌 Disconnect Auto WA", "auto_disconnect_wa").row()
+        .text("🏠 Main Menu", "main_menu"),
+    }
+  );
+});
+
+bot.callbackQuery("auto_chat_refresh", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const session = autoChatSessions.get(userId);
+  if (!session?.running) {
+    await ctx.editMessageText(
+      "✅ <b>Auto Chat has stopped.</b>",
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+    );
+    return;
+  }
+  const progressText = autoChatProgressText(session);
+  try {
+    await ctx.editMessageText(progressText, {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("🔄 Refresh", "auto_chat_refresh")
+        .text("⏹️ Stop", "auto_chat_stop").row()
+        .text("🏠 Main Menu", "main_menu"),
+    });
+  } catch {}
+});
+
+bot.callbackQuery("auto_chat_stop", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const session = autoChatSessions.get(userId);
+  if (!session?.running) {
+    await ctx.editMessageText("ℹ️ Auto Chat already stopped.", {
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+  await ctx.editMessageText(
+    "⚠️ <b>Auto Chat Band Karo?</b>\n\nKya aap auto chat band karna chahte ho?",
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("✅ Haan, Band Karo", "auto_chat_stop_confirm")
+        .text("❌ Wapas Jao", "auto_chat_refresh"),
+    }
+  );
+});
+
+bot.callbackQuery("auto_chat_stop_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const session = autoChatSessions.get(userId);
+  if (session) {
+    session.cancelled = true;
+    session.running = false;
+  }
+  await ctx.editMessageText("⏹️ <b>Auto Chat band kar diya gaya!</b>", {
+    parse_mode: "HTML",
+    reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+  });
+});
+
+bot.callbackQuery("auto_disconnect_wa", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const autoUserId = getAutoUserId(String(userId));
+  if (!isAutoConnected(String(userId))) {
+    await ctx.editMessageText("ℹ️ Auto Chat WhatsApp already disconnected.", {
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    }); return;
+  }
+  await ctx.editMessageText(
+    "⚠️ <b>Auto Chat WA Disconnect karo?</b>",
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("✅ Haan", "auto_disconnect_confirm")
+        .text("❌ Cancel", "main_menu"),
+    }
+  );
+});
+
+bot.callbackQuery("auto_disconnect_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const autoUserId = getAutoUserId(String(userId));
+  await disconnectWhatsApp(autoUserId);
+  const session = autoChatSessions.get(userId);
+  if (session) { session.cancelled = true; session.running = false; }
+  autoChatSessions.delete(userId);
+  await ctx.editMessageText("✅ <b>Auto Chat WhatsApp disconnected!</b>", {
+    parse_mode: "HTML", reply_markup: mainMenu(userId),
+  });
+});
+
+bot.callbackQuery("auto_chat_start", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!(await checkAccessMiddleware(ctx))) return;
+  if (!isAutoConnected(String(userId))) {
+    await ctx.editMessageText("❌ Auto Chat WA connected nahi hai.", {
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+
+  const autoUserId = getAutoUserId(String(userId));
+  let groups: Array<{ id: string; subject: string }> = [];
+  try {
+    groups = await getAllGroups(autoUserId);
+  } catch {}
+
+  if (!groups.length) {
+    await ctx.editMessageText("❌ <b>Koi group nahi mila!</b>\n\nAuto Chat WA me koi group nahi hai.", {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+
+  userStates.set(userId, {
+    step: "auto_chat_select_groups",
+    chatInGroupData: {
+      allGroups: groups,
+      selectedIndices: new Set(),
+      page: 0,
+      message: "",
+      delaySeconds: 5,
+      cancelled: false,
+    },
+  });
+
+  await ctx.editMessageText(
+    "💬 <b>Auto Chat — Groups Select Karo</b>\n\n" +
+    `📋 ${groups.length} groups mile.\n\n` +
+    "Jin groups me msg bhejnha hai unhe select karo:",
+    {
+      parse_mode: "HTML",
+      reply_markup: buildAutoGroupKeyboard(userStates.get(userId)!),
+    }
+  );
+});
+
+function buildAutoGroupKeyboard(state: UserState): InlineKeyboard {
+  const data = state.chatInGroupData!;
+  const kb = new InlineKeyboard();
+  const groups = data.allGroups;
+  const selected = data.selectedIndices;
+  const page = data.page;
+  const totalPages = Math.max(1, Math.ceil(groups.length / CIG_PAGE_SIZE));
+  const start = page * CIG_PAGE_SIZE;
+  const end = Math.min(start + CIG_PAGE_SIZE, groups.length);
+
+  for (let i = start; i < end; i++) {
+    const g = groups[i];
+    const isSelected = selected.has(i);
+    kb.text(`${isSelected ? "✅" : "☐"} ${g.subject.substring(0, 28)}`, `act_tog_${i}`).row();
+  }
+
+  if (totalPages > 1) {
+    const prev = page > 0 ? "⬅️ Prev" : " ";
+    const next = page < totalPages - 1 ? "Next ➡️" : " ";
+    kb.text(prev, "act_prev_page").text(`📄 ${page + 1}/${totalPages}`, "act_page_info").text(next, "act_next_page").row();
+  }
+
+  kb.text("☑️ Sab Select", "act_select_all").text("🧹 Clear", "act_clear_all").row();
+  if (selected.size > 0) {
+    kb.text(`✅ Aage Badho (${selected.size} groups)`, "act_proceed").row();
+  }
+  kb.text("🏠 Main Menu", "main_menu");
+  return kb;
+}
+
+bot.callbackQuery(/^act_tog_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || state.step !== "auto_chat_select_groups") return;
+  const idx = parseInt(ctx.match[1]);
+  const selected = state.chatInGroupData.selectedIndices;
+  if (selected.has(idx)) selected.delete(idx); else selected.add(idx);
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildAutoGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("act_select_all", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  for (let i = 0; i < state.chatInGroupData.allGroups.length; i++) state.chatInGroupData.selectedIndices.add(i);
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildAutoGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("act_clear_all", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  state.chatInGroupData.selectedIndices.clear();
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildAutoGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("act_prev_page", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || state.chatInGroupData.page <= 0) return;
+  state.chatInGroupData.page--;
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildAutoGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("act_next_page", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  const data = state.chatInGroupData;
+  const totalPages = Math.ceil(data.allGroups.length / CIG_PAGE_SIZE);
+  if (data.page < totalPages - 1) data.page++;
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildAutoGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("act_page_info", async (ctx) => { await ctx.answerCallbackQuery(); });
+
+bot.callbackQuery("act_proceed", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || state.chatInGroupData.selectedIndices.size === 0) return;
+  state.step = "auto_chat_set_message";
+  const count = state.chatInGroupData.selectedIndices.size;
+  await ctx.editMessageText(
+    `✅ <b>${count} groups select kiye!</b>\n\n` +
+    "📝 Ab wo message bhejo jo in groups me Auto Chat se bhejnha hai:",
+    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("❌ Cancel", "main_menu") }
+  );
+});
+
+bot.callbackQuery("auto_chat_confirm_start", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || !state.chatInGroupData.message) return;
+
+  const data = state.chatInGroupData;
+  const selectedGroups = [...data.selectedIndices].map(i => data.allGroups[i]);
+  const autoUserId = getAutoUserId(String(userId));
+
+  const statusMsg = await ctx.editMessageText(
+    "🤖 <b>Auto Chat Shuru Ho Gaya!</b>\n\n⏳ Background me messages ja rahe hain...",
+    { parse_mode: "HTML" }
+  );
+  const msgId = (statusMsg as any).message_id;
+  const chatId = ctx.chat!.id;
+  userStates.delete(userId);
+  void runAutoChatBackground(userId, autoUserId, chatId, msgId, selectedGroups, data.message, data.delaySeconds, 0);
+});
+
+function autoChatProgressText(session: AutoChatSession): string {
+  const total = session.groups.length;
+  const processed = session.sent + session.failed;
+  const percent = total > 0 ? Math.floor((processed / total) * 100) : 0;
+  return (
+    "🤖 <b>Auto Chat Chal Raha Hai...</b>\n\n" +
+    `🔁 Round: <b>${session.currentRound}/${session.repeatCount === 0 ? "∞" : session.repeatCount}</b>\n` +
+    `📤 Sent: <b>${session.sent}</b>\n` +
+    `❌ Failed: <b>${session.failed}</b>\n` +
+    `📊 Progress: <b>${percent}%</b>\n\n` +
+    "Roknay ke liye Stop dabao."
+  );
+}
+
+async function runAutoChatBackground(userId: number, autoUserId: string, chatId: number, msgId: number, groups: Array<{ id: string; subject: string }>, message: string, delaySeconds: number, repeatCount: number): Promise<void> {
+  const session: AutoChatSession = {
+    running: true,
+    cancelled: false,
+    chatId,
+    msgId,
+    groups,
+    message,
+    delaySeconds,
+    repeatCount,
+    sent: 0,
+    failed: 0,
+    currentRound: 1,
+  };
+  autoChatSessions.set(userId, session);
+
+  const maxRounds = repeatCount === 0 ? Infinity : repeatCount;
+
+  try {
+    for (let round = 1; round <= maxRounds; round++) {
+      if (session.cancelled) break;
+      session.currentRound = round;
+
+      for (const group of groups) {
+        if (session.cancelled) break;
+        const ok = await sendGroupMessage(autoUserId, group.id, message);
+        if (ok) session.sent++; else session.failed++;
+
+        try {
+          await bot.api.editMessageText(chatId, msgId, autoChatProgressText(session), {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🔄 Refresh", "auto_chat_refresh")
+              .text("⏹️ Stop", "auto_chat_stop").row()
+              .text("🏠 Main Menu", "main_menu"),
+          });
+        } catch {}
+
+        if (!session.cancelled && delaySeconds > 0) {
+          await new Promise(r => setTimeout(r, delaySeconds * 1000));
+        }
+      }
+
+      if (!session.cancelled && round < maxRounds && delaySeconds > 0) {
+        await new Promise(r => setTimeout(r, delaySeconds * 1000));
+      }
+    }
+  } catch (err: any) {
+    console.error(`[AUTO_CHAT][${userId}] Error:`, err?.message);
+  }
+
+  session.running = false;
+  if (!session.cancelled) {
+    try {
+      await bot.api.editMessageText(chatId, msgId,
+        `✅ <b>Auto Chat Complete!</b>\n\n📤 Sent: ${session.sent}\n❌ Failed: ${session.failed}`,
+        { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+      );
+    } catch {}
+  }
+}
+
+// ─── Chat In Group Feature ─────────────────────────────────────────────────────
+
+const CIG_PAGE_SIZE = 15;
+
+function buildChatGroupKeyboard(state: UserState): InlineKeyboard {
+  const data = state.chatInGroupData!;
+  const kb = new InlineKeyboard();
+  const groups = data.allGroups;
+  const selected = data.selectedIndices;
+  const page = data.page;
+  const totalPages = Math.max(1, Math.ceil(groups.length / CIG_PAGE_SIZE));
+  const start = page * CIG_PAGE_SIZE;
+  const end = Math.min(start + CIG_PAGE_SIZE, groups.length);
+
+  for (let i = start; i < end; i++) {
+    const g = groups[i];
+    const isSelected = selected.has(i);
+    kb.text(`${isSelected ? "✅" : "☐"} ${g.subject.substring(0, 28)}`, `cig_tog_${i}`).row();
+  }
+
+  if (totalPages > 1) {
+    const prev = page > 0 ? "⬅️ Prev" : " ";
+    const next = page < totalPages - 1 ? "Next ➡️" : " ";
+    kb.text(prev, "cig_prev_page").text(`📄 ${page + 1}/${totalPages}`, "cig_page_info").text(next, "cig_next_page").row();
+  }
+
+  kb.text("☑️ Sab Select", "cig_select_all").text("🧹 Clear", "cig_clear_all").row();
+  if (selected.size > 0) {
+    kb.text(`✅ Aage Badho (${selected.size} groups)`, "cig_proceed").row();
+  }
+  kb.text("🏠 Main Menu", "main_menu");
+  return kb;
+}
+
+bot.callbackQuery("chat_in_group", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!(await checkAccessMiddleware(ctx))) return;
+  if (!isConnected(String(userId))) {
+    await ctx.editMessageText("📱 <b>WhatsApp not connected!</b>\n\nConnect first to use this feature.", {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("📱 Connect", "connect_wa").text("🏠 Menu", "main_menu"),
+    });
+    return;
+  }
+
+  let groups: Array<{ id: string; subject: string }> = [];
+  try {
+    groups = await getAllGroups(String(userId));
+  } catch {}
+
+  if (!groups.length) {
+    await ctx.editMessageText("❌ <b>Koi group nahi mila!</b>", {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+
+  userStates.set(userId, {
+    step: "cig_select_groups",
+    chatInGroupData: {
+      allGroups: groups,
+      selectedIndices: new Set(),
+      page: 0,
+      message: "",
+      delaySeconds: 3,
+      cancelled: false,
+    },
+  });
+
+  await ctx.editMessageText(
+    `💬 <b>Chat In Group</b>\n\n📋 ${groups.length} groups mile.\nJin groups me msg bhejnha hai unhe select karo:`,
+    { parse_mode: "HTML", reply_markup: buildChatGroupKeyboard(userStates.get(userId)!) }
+  );
+});
+
+bot.callbackQuery(/^cig_tog_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  const idx = parseInt(ctx.match[1]);
+  const selected = state.chatInGroupData.selectedIndices;
+  if (selected.has(idx)) selected.delete(idx); else selected.add(idx);
+  try {
+    await ctx.editMessageReplyMarkup({ reply_markup: buildChatGroupKeyboard(state) });
+  } catch {}
+});
+
+bot.callbackQuery("cig_select_all", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  const data = state.chatInGroupData;
+  for (let i = 0; i < data.allGroups.length; i++) data.selectedIndices.add(i);
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildChatGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("cig_clear_all", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  state.chatInGroupData.selectedIndices.clear();
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildChatGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("cig_prev_page", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || state.chatInGroupData.page <= 0) return;
+  state.chatInGroupData.page--;
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildChatGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("cig_next_page", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData) return;
+  const data = state.chatInGroupData;
+  const totalPages = Math.ceil(data.allGroups.length / CIG_PAGE_SIZE);
+  if (data.page < totalPages - 1) data.page++;
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildChatGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("cig_page_info", async (ctx) => { await ctx.answerCallbackQuery(); });
+
+bot.callbackQuery("cig_proceed", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || state.chatInGroupData.selectedIndices.size === 0) return;
+  state.step = "cig_enter_message";
+  const count = state.chatInGroupData.selectedIndices.size;
+  await ctx.editMessageText(
+    `✅ <b>${count} groups select kiye!</b>\n\n` +
+    "📝 Ab wo message bhejo jo in groups me bhejnha hai:",
+    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("❌ Cancel", "main_menu") }
+  );
+});
+
+bot.callbackQuery("cig_start_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.chatInGroupData || !state.chatInGroupData.message) return;
+
+  const data = state.chatInGroupData;
+  const selectedGroups = [...data.selectedIndices].map(i => data.allGroups[i]);
+  const statusMsg = await ctx.editMessageText(
+    `⏳ <b>Message bhej raha hun...</b>\n\n📤 0/${selectedGroups.length} done...`,
+    { parse_mode: "HTML" }
+  );
+  const msgId = (statusMsg as any).message_id;
+  const chatId = ctx.chat!.id;
+  userStates.delete(userId);
+  void cigSendBackground(userId, String(userId), chatId, msgId, selectedGroups, data.message, data.delaySeconds);
+});
+
+bot.callbackQuery("cig_cancel_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (state?.chatInGroupData) state.chatInGroupData.cancelled = true;
+  userStates.delete(userId);
+  await ctx.editMessageText("❌ <b>Cancelled.</b>", {
+    parse_mode: "HTML",
+    reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+  });
+});
+
+async function cigSendBackground(userId: number, waUserId: string, chatId: number, msgId: number, groups: Array<{ id: string; subject: string }>, message: string, delaySeconds: number): Promise<void> {
+  let sent = 0;
+  let failed = 0;
+
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i];
+    const ok = await sendGroupMessage(waUserId, group.id, message);
+    if (ok) sent++; else failed++;
+
+    try {
+      await bot.api.editMessageText(chatId, msgId,
+        `📤 <b>Messages bhej raha hun...</b>\n\n` +
+        `✅ Sent: ${sent}\n❌ Failed: ${failed}\n` +
+        `📊 Progress: ${i + 1}/${groups.length}\n\n` +
+        `⏳ Last: ${group.subject}`,
+        { parse_mode: "HTML" }
+      );
+    } catch {}
+
+    if (i < groups.length - 1 && delaySeconds > 0) {
+      await new Promise(r => setTimeout(r, delaySeconds * 1000));
+    }
+  }
+
+  try {
+    await bot.api.editMessageText(chatId, msgId,
+      `✅ <b>Done!</b>\n\n📤 Sent: ${sent}\n❌ Failed: ${failed}\n📊 Total: ${groups.length} groups`,
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+    );
+  } catch {}
+}
+
 // ─── Add Members Feature ──────────────────────────────────────────────────────
 
 bot.callbackQuery("add_members", async (ctx) => {
@@ -3800,63 +4417,105 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  if (state.step === "ac_connect_second_phone") {
+  if (state.step === "auto_connect_phone") {
     const phone = text.replace(/\s/g, "");
     if (!/^\+?\d{10,15}$/.test(phone)) {
-      await ctx.reply("❌ Invalid phone number.\nExample: <code>+919942222222</code>", { parse_mode: "HTML" }); return;
+      await ctx.reply("❌ Invalid phone number.\nExample: <code>919876543210</code>", { parse_mode: "HTML" }); return;
     }
-    const secondKey = `second_${userId}`;
     userStates.delete(userId);
+    const autoUserId = getAutoUserId(String(userId));
     const statusMsg = await ctx.reply(
-      `⏳ <b>Connecting 2nd Account...</b>\n\n📱 Phone: <code>${esc(phone)}</code>\n\n⌛ Pairing code aa raha hai, please wait...`,
+      `⏳ <b>Auto Chat WA Connecting...</b>\n\n📱 Phone: <code>${esc(phone)}</code>\n\n⌛ Pairing code aa raha hai, 10-20 seconds wait karo...`,
       { parse_mode: "HTML" }
     );
     try {
-      await connectWhatsApp(secondKey, phone,
+      await connectWhatsApp(autoUserId, phone,
         async (code) => {
           try {
             await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id,
-              `🔑 <b>2nd Account Pairing Code:</b>\n\n<code>${esc(code)}</code>\n\n` +
-              `📋 <b>Steps:</b>\n1️⃣ Doosre phone mein WhatsApp kholein\n2️⃣ Settings → Linked Devices\n` +
-              `3️⃣ "Link a Device" dabayein\n4️⃣ "Link with phone number instead" dabayein\n` +
-              `5️⃣ Code enter karein: <code>${esc(code)}</code>\n\n⌛ Waiting for confirmation...`,
+              `🔑 <b>Auto Chat WA Pairing Code:</b>\n\n<code>${esc(code)}</code>\n\n` +
+              `📋 <b>Steps:</b>\n1️⃣ 2nd WhatsApp open karo\n2️⃣ Settings → Linked Devices\n` +
+              `3️⃣ Tap "Link a Device"\n4️⃣ Tap "Link with phone number instead"\n` +
+              `5️⃣ Code enter karo: <code>${esc(code)}</code>\n\n⌛ Confirm hone ka wait kar raha hun...`,
               { parse_mode: "HTML" }
             );
           } catch {}
         },
         async () => {
           try {
+            const autoNumber = getAutoConnectedNumber(String(userId));
             await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id,
-              `✅ <b>2nd WhatsApp Connected!</b>\n\n📱 ${esc(phone)}\n\nAb Auto Chat features use kar sakte ho!`,
-              {
-                parse_mode: "HTML",
-                reply_markup: new InlineKeyboard()
-                  .text("👫 Chat with Friend", "ac_mode_friend")
-                  .row()
-                  .text("👥 Chat in Group", "ac_mode_group")
-                  .row()
-                  .text("🏠 Menu", "main_menu"),
-              }
+              `✅ <b>Auto Chat WhatsApp Connected!</b>\n\n` +
+              (autoNumber ? `📞 Auto Number: <code>${esc(autoNumber)}</code>\n\n` : "") +
+              `🎉 Ab Auto Chat use kar sakte ho!`,
+              { parse_mode: "HTML", reply_markup: mainMenu(userId) }
             );
           } catch {}
         },
         async (reason) => {
           try {
             await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id,
-              `⚠️ <b>2nd Account Disconnected</b>\n\nReason: ${esc(reason)}\n\n🔄 Phir se try karo.`,
-              { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📱 Reconnect", "ac_connect_second").text("🏠 Menu", "main_menu") }
+              `⚠️ <b>Auto Chat WA Disconnected</b>\n\nReason: ${esc(reason)}\n\n🔄 Dobara try karo.`,
+              { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🤖 Connect Auto WA", "connect_auto_wa").text("🏠 Menu", "main_menu") }
             );
           } catch {}
         }
       );
     } catch (err: any) {
+      console.error(`[BOT] auto connectWhatsApp threw for user ${userId}:`, err?.message);
       try {
         await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id,
-          `❌ <b>Connection Failed</b>\n\nError: ${esc(err?.message || "Unknown error")}\n\n🔄 Phir se try karo.`,
-          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📱 Try Again", "ac_connect_second").text("🏠 Menu", "main_menu") }
+          `❌ <b>Connection Failed</b>\n\nError: ${esc(err?.message || "Unknown error")}\n\n🔄 Please try again.`,
+          { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🤖 Connect Auto WA", "connect_auto_wa").text("🏠 Menu", "main_menu") }
         );
       } catch {}
     }
+    return;
+  }
+
+  if (state.step === "cig_enter_message" && state.chatInGroupData) {
+    state.chatInGroupData.message = text;
+    state.step = "cig_confirm";
+    const data = state.chatInGroupData;
+    const selectedGroups = [...data.selectedIndices].map(i => data.allGroups[i]);
+    const previewGroups = selectedGroups.slice(0, 5).map(g => `• ${esc(g.subject)}`).join("\n");
+    const moreText = selectedGroups.length > 5 ? `\n... +${selectedGroups.length - 5} more` : "";
+    await ctx.reply(
+      `✅ <b>Message Set!</b>\n\n` +
+      `📝 Message: <i>${esc(text.substring(0, 100))}${text.length > 100 ? "..." : ""}</i>\n\n` +
+      `📋 Groups (${selectedGroups.length}):\n${previewGroups}${moreText}\n\n` +
+      `⏱️ Delay: ${data.delaySeconds}s per group\n\n` +
+      `Message bhejun?`,
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard()
+          .text("✅ Haan, Bhejo!", "cig_start_confirm")
+          .text("❌ Cancel", "cig_cancel_confirm"),
+      }
+    );
+    return;
+  }
+
+  if (state.step === "auto_chat_set_message" && state.chatInGroupData) {
+    state.chatInGroupData.message = text;
+    state.step = "auto_chat_confirm";
+    const data = state.chatInGroupData;
+    const selectedGroups = [...data.selectedIndices].map(i => data.allGroups[i]);
+    const previewGroups = selectedGroups.slice(0, 5).map(g => `• ${esc(g.subject)}`).join("\n");
+    const moreText = selectedGroups.length > 5 ? `\n... +${selectedGroups.length - 5} more` : "";
+    await ctx.reply(
+      `✅ <b>Auto Chat Setup Ready!</b>\n\n` +
+      `📝 Message: <i>${esc(text.substring(0, 100))}${text.length > 100 ? "..." : ""}</i>\n\n` +
+      `📋 Groups (${selectedGroups.length}):\n${previewGroups}${moreText}\n\n` +
+      `⏱️ Delay: ${data.delaySeconds}s\n\n` +
+      `Auto Chat shuru karoon?`,
+      {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard()
+          .text("✅ Shuru Karo!", "auto_chat_confirm_start")
+          .text("❌ Cancel", "main_menu"),
+      }
+    );
     return;
   }
 
@@ -4021,25 +4680,15 @@ bot.on("message:text", async (ctx) => {
     }
 
     const selectedGroups = Array.from(state.makeAdminData.selectedIndices).map(i => state.makeAdminData!.allGroups[i]);
-    const groupList = selectedGroups.slice(0, 20).map(g => `• ${esc(g.subject)}`).join("\n");
-    const moreText = selectedGroups.length > 20 ? `\n... +${selectedGroups.length - 20} more` : "";
-    const numList = phoneNumbers.map(n => `📱 <code>${esc(n)}</code>`).join("\n");
+    const chatId = ctx.chat.id;
+    userStates.delete(userId);
 
-    (state as any).makeAdminPendingNumbers = phoneNumbers;
-    state.step = "make_admin_confirm";
-
-    await ctx.reply(
-      `⚠️ <b>Confirm Make Admin</b>\n\n` +
-      `👑 <b>Groups (${selectedGroups.length}):</b>\n${groupList}${moreText}\n\n` +
-      `📱 <b>Numbers to make admin (${phoneNumbers.length}):</b>\n${numList}\n\n` +
-      `Are you sure you want to make these numbers admin?`,
-      {
-        parse_mode: "HTML",
-        reply_markup: new InlineKeyboard()
-          .text("✅ Yes, Make Admin", "ma_confirm_yes")
-          .text("❌ Cancel", "main_menu"),
-      }
+    const statusMsg = await ctx.reply(
+      `⏳ <b>Making ${phoneNumbers.length} number(s) admin in ${selectedGroups.length} group(s)...</b>\n\n⌛ Please wait...`,
+      { parse_mode: "HTML" }
     );
+
+    void makeAdminBackground(String(userId), selectedGroups, phoneNumbers, chatId, statusMsg.message_id);
     return;
   }
 
@@ -4156,37 +4805,6 @@ bot.callbackQuery("rm_confirm_with_exclude", async (ctx) => {
   if (!state?.removeExcludeData) return;
 
   await startRemoveMembersProcess(ctx, userId, state.removeExcludeData.selectedGroups, state.removeExcludeData.excludeNumbers);
-});
-
-bot.callbackQuery("ma_confirm_yes", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  const state = userStates.get(userId);
-  if (!state?.makeAdminData) return;
-
-  const phoneNumbers: string[] = (state as any).makeAdminPendingNumbers || [];
-  if (phoneNumbers.length === 0) {
-    await ctx.editMessageText("❌ No phone numbers found. Please try again.", {
-      reply_markup: new InlineKeyboard().text("🏠 Menu", "main_menu"),
-    });
-    return;
-  }
-
-  const selectedGroups = Array.from(state.makeAdminData.selectedIndices).map(i => state.makeAdminData!.allGroups[i]);
-  const chatId = ctx.callbackQuery.message?.chat.id;
-  const msgId = ctx.callbackQuery.message?.message_id;
-  userStates.delete(userId);
-
-  try {
-    if (msgId) {
-      await ctx.editMessageText(
-        `⏳ <b>Making ${phoneNumbers.length} number(s) admin in ${selectedGroups.length} group(s)...</b>\n\n⌛ Please wait...`,
-        { parse_mode: "HTML" }
-      );
-    }
-  } catch {}
-
-  void makeAdminBackground(String(userId), selectedGroups, phoneNumbers, chatId!, msgId!);
 });
 
 // ─── Photo Handler ───────────────────────────────────────────────────────────
@@ -4316,563 +4934,6 @@ bot.on("message:document", async (ctx) => {
   } catch (err: any) {
     await ctx.reply(`❌ Error: ${esc(err?.message || "Unknown")}`, { parse_mode: "HTML" });
   }
-});
-
-// ─── Auto Chat Feature ───────────────────────────────────────────────────────
-
-interface AutoChatSession {
-  userId1: string;
-  userId2: string;
-  mode: "friend" | "group";
-  groupId?: string;
-  groupName?: string;
-  active: boolean;
-  msgCount1: number;
-  msgCount2: number;
-  interval?: ReturnType<typeof setInterval>;
-  chatId: number;
-  statusMsgId?: number;
-}
-
-const autoChatSessions: Map<number, AutoChatSession> = new Map();
-const autoChatCancelConfirm: Set<number> = new Set();
-
-const funnyMessages = [
-  "Bhai sun, aaj college mein kya hua pata hai? 😂",
-  "Kal ka homework kiya? Main toh bhool gaya yaar 😅",
-  "Exam ki tayari ho rahi hai? Nahi toh maar khayega 😬",
-  "Teacher ne aaj phir lecture mein neend aa gayi mujhe 😴",
-  "Canteen ka samosa khaya? Ekdum mast tha aaj 🤤",
-  "Yaar library mein aaj seat nahi mili, bas! 😤",
-  "Group study karte hain kal? Ya phir phone pe hi..? 📱",
-  "Aaj ka paper kaisa laga? Main toh gaya 💀",
-  "Bhai internship ke liye apply kiya? Main toh soch raha hun 🤔",
-  "Mere notes mil sakte hain? Poori class miss ho gayi 🙏",
-  "School ke din yaad aa rahe hain... kitna aasaan tha woh sab 😌",
-  "Result kab aayega yaar? Neend nahi aa rahi 😰",
-  "Professor ne project extend kiya! Ab chain se so sakte hain 😎",
-  "Aaj practical mein kuch samajh nahi aaya... shayad raat ko padh lun 📚",
-  "Dost, mere liye bhi chai leke aa? Mujhe bhook lagi hai bahut 🍵",
-  "Yaar assignment ka last date kal hai, abhi karna start karta hun 😵",
-  "Kya scene hai? Phir se wifi nahi chal raha college mein 😡",
-  "Bhai mera tiffin ghar bhool gaya aaj... bhook lagi hai 😩",
-  "Semester end exam ke liye kya plan hai tera? 📖",
-  "Yaar chhuti leni chahiye thi aaj... mood nahi tha aane ka 🥱",
-  "Hahaha aaj sir ne bahut funny joke maara class mein 😂",
-  "Kya re, gym jaana shuru kiya ya still socha hi hai? 💪",
-  "Bhai notice board pe kuch naya hai kya? Dekhna toh 👀",
-  "Aaj ki presentation acchi gayi meri? Bahut nervous tha main 😅",
-  "Yaar phir se attendance short ho gayi... bacchao mujhe 🙈",
-];
-
-function getRandomMessage(): string {
-  return funnyMessages[Math.floor(Math.random() * funnyMessages.length)];
-}
-
-function autoChatStatusText(session: AutoChatSession): string {
-  const total = session.msgCount1 + session.msgCount2;
-  const target = session.mode === "friend" ? "Friend Chat" : `Group: ${session.groupName}`;
-  return (
-    `💬 <b>Auto Chat Running</b>\n\n` +
-    `📍 Mode: <b>${session.mode === "friend" ? "Chat with Friend" : "Chat in Group"}</b>\n` +
-    `🎯 Target: <b>${esc(target)}</b>\n\n` +
-    `📊 <b>Messages Sent:</b>\n` +
-    `📱 Account 1: <b>${session.msgCount1}</b> messages\n` +
-    `📱 Account 2: <b>${session.msgCount2}</b> messages\n` +
-    `📨 Total: <b>${total}</b> messages\n\n` +
-    `⏱️ Sending every ~30 seconds...\n` +
-    `Press <b>Stop</b> to stop the chat.`
-  );
-}
-
-function autoChatRunningKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().text("⛔ Stop Chat", "ac_stop_request");
-}
-
-function autoChatReadyKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("👫 Chat with Friend", "ac_mode_friend")
-    .text("👥 Chat in Group", "ac_mode_group")
-    .row()
-    .text("🔌 Disconnect 2nd Account", "ac_disconnect_second")
-    .text("🏠 Main Menu", "main_menu");
-}
-
-async function updateAutoChatStatus(session: AutoChatSession): Promise<void> {
-  await bot.api.editMessageText(session.chatId, session.statusMsgId!, autoChatStatusText(session), {
-    parse_mode: "HTML",
-    reply_markup: autoChatRunningKeyboard(),
-  }).catch(() => {});
-}
-
-async function stopAutoChatForDisconnect(session: AutoChatSession): Promise<void> {
-  session.active = false;
-  clearAutoChatTimer(session);
-  await bot.api.editMessageText(
-    session.chatId,
-    session.statusMsgId!,
-    "⚠️ <b>Auto Chat Stopped</b>\n\nOne WhatsApp account was disconnected.",
-    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
-  ).catch(() => {});
-}
-
-function scheduleAutoChatMessage(userId: number, sendNext: (session: AutoChatSession) => Promise<void>): void {
-  const session = autoChatSessions.get(userId);
-  if (!session?.active) return;
-  session.nextDelayMs = getRandomAutoChatDelayMs();
-  void updateAutoChatStatus(session);
-  session.timeout = setTimeout(async () => {
-    const current = autoChatSessions.get(userId);
-    if (!current?.active) return;
-    if (!isConnected(current.userId1) || !isConnected(current.userId2)) {
-      await stopAutoChatForDisconnect(current);
-      return;
-    }
-    await sendNext(current);
-    if (current.active) scheduleAutoChatMessage(userId, sendNext);
-  }, session.nextDelayMs);
-}
-
-bot.callbackQuery("auto_chat", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-  if (!isConnected(String(userId))) {
-    await ctx.editMessageText("❌ <b>WhatsApp not connected!</b>\n\nPehle apna pehla WhatsApp connect karo.", {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard().text("📱 Connect", "connect_wa").text("🏠 Menu", "main_menu"),
-    }); return;
-  }
-
-  await ctx.editMessageText(
-    `💬 <b>Auto Chat Feature</b>\n\n` +
-    `Is feature mein aapko ek <b>doosra WhatsApp</b> bhi connect karna hoga.\n\n` +
-    `📱 <b>Currently connected:</b> ${getConnectedWhatsAppNumber(String(userId)) || "Account 1"}\n\n` +
-    `Aage badhne ke liye <b>Connect 2nd WhatsApp</b> dabao:`,
-    {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard()
-        .text("📱 Connect 2nd WhatsApp", "ac_connect_second")
-        .row()
-        .text("🔙 Back", "main_menu"),
-    }
-  );
-});
-
-const secondSessionWaiters: Map<number, { chatId: number; msgId?: number }> = new Map();
-
-bot.callbackQuery("ac_connect_second", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-
-  const secondKey = `second_${userId}`;
-  if (isConnected(secondKey)) {
-    await ctx.editMessageText(
-      `✅ <b>Doosra WhatsApp already connected hai!</b>\n\n` +
-      `📱 Account 2: ${getConnectedWhatsAppNumber(secondKey) || "Connected"}\n\n` +
-      `Ab kya karna chahte ho?`,
-      {
-        parse_mode: "HTML",
-        reply_markup: new InlineKeyboard()
-          .text("👫 Chat with Friend", "ac_mode_friend")
-          .text("👥 Chat in Group", "ac_mode_group")
-          .row()
-          .text("🔌 Disconnect 2nd Account", "ac_disconnect_second")
-          .text("🔙 Back", "main_menu"),
-      }
-    );
-    return;
-  }
-
-  userStates.set(userId, { step: "ac_connect_second_phone" });
-  await ctx.editMessageText(
-    "📱 <b>2nd WhatsApp Connect Karo</b>\n\nDoosre WhatsApp ka phone number bhejo (country code ke saath):\n\nExample: <code>+919942222222</code>",
-    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🔙 Cancel", "auto_chat") }
-  );
-});
-
-bot.callbackQuery("ac_disconnect_second", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  const secondKey = `second_${userId}`;
-  await disconnectWhatsApp(secondKey);
-  await ctx.editMessageText(
-    "✅ <b>2nd WhatsApp disconnect ho gaya!</b>",
-    { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("📱 Reconnect", "ac_connect_second").text("🏠 Menu", "main_menu") }
-  );
-});
-
-bot.callbackQuery("ac_mode_friend", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-
-  const secondKey = `second_${userId}`;
-  const acc1 = getConnectedWhatsAppNumber(String(userId)) || "Account 1";
-  const acc2 = getConnectedWhatsAppNumber(secondKey) || "Account 2";
-
-  if (!isConnected(String(userId)) || !isConnected(secondKey)) {
-    await ctx.editMessageText("❌ Dono accounts connected hone chahiye.", {
-      reply_markup: new InlineKeyboard().text("🔙 Back", "auto_chat"),
-    }); return;
-  }
-
-  await ctx.editMessageText(
-    `👫 <b>Chat with Friend</b>\n\n` +
-    `📱 <b>Account 1:</b> ${esc(acc1)}\n` +
-    `📱 <b>Account 2:</b> ${esc(acc2)}\n\n` +
-    `Both accounts will send study, exam, and school/college messages to each other in rotation.\n\n` +
-    `⏱️ Delay rotates randomly: 30 seconds, 1 minute, 5 minutes, 10 minutes, 20 minutes, 30 minutes, or 1 hour.\n\n` +
-    `Confirm to start:`,
-    {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard()
-        .text("▶️ Start Chat", "ac_start_friend")
-        .text("❌ Cancel", "main_menu"),
-    }
-  );
-});
-
-bot.callbackQuery("ac_mode_group", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-
-  const secondKey = `second_${userId}`;
-  if (!isConnected(String(userId)) || !isConnected(secondKey)) {
-    await ctx.editMessageText("❌ Dono accounts connected hone chahiye.", {
-      reply_markup: new InlineKeyboard().text("🔙 Back", "auto_chat"),
-    }); return;
-  }
-
-  await ctx.editMessageText("🔍 <b>Common Groups dhundh raha hun...</b>\n\nPlease wait...", { parse_mode: "HTML" });
-
-  const groups1 = await getAllGroups(String(userId));
-  const groups2 = await getAllGroups(secondKey);
-
-  const ids1 = new Set(groups1.map(g => g.id));
-  const commonGroups = groups2.filter(g => ids1.has(g.id));
-
-  if (!commonGroups.length) {
-    await ctx.editMessageText(
-      "📭 <b>Koi common group nahi mila!</b>\n\nDono accounts kisi ek common group mein hone chahiye.",
-      {
-        parse_mode: "HTML",
-        reply_markup: new InlineKeyboard().text("🔙 Back", "auto_chat"),
-      }
-    ); return;
-  }
-
-  userStates.set(userId, {
-    step: "ac_select_group",
-    removeData: {
-      allGroups: commonGroups.map(g => ({ id: g.id, subject: g.subject })),
-      selectedIndices: new Set(),
-      page: 0,
-    },
-  });
-
-  const PAGE_SIZE = 20;
-  const page = 0;
-  const totalPages = Math.ceil(commonGroups.length / PAGE_SIZE);
-  const start = page * PAGE_SIZE;
-  const end = Math.min(start + PAGE_SIZE, commonGroups.length);
-
-  const kb = new InlineKeyboard();
-  for (let i = start; i < end; i++) {
-    kb.text(commonGroups[i].subject, `ac_grp_${i}`).row();
-  }
-  if (totalPages > 1) {
-    kb.text("⬅️ Prev", "ac_grp_prev").text(`📄 1/${totalPages}`, "ac_grp_page").text("Next ➡️", "ac_grp_next").row();
-  }
-  kb.text("🔙 Back", "auto_chat");
-
-  await ctx.editMessageText(
-    `👥 <b>Group Select Karo</b>\n\n` +
-    `📊 Common groups found: <b>${commonGroups.length}</b>\n\n` +
-    `Jis group mein chat karna hai woh select karo:`,
-    { parse_mode: "HTML", reply_markup: kb }
-  );
-});
-
-bot.callbackQuery(/^ac_grp_(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  const state = userStates.get(userId);
-  if (!state?.removeData) return;
-
-  const idx = parseInt(ctx.match![1]);
-  const group = state.removeData.allGroups[idx];
-  if (!group) return;
-
-  const secondKey = `second_${userId}`;
-  const acc1 = getConnectedWhatsAppNumber(String(userId)) || "Account 1";
-  const acc2 = getConnectedWhatsAppNumber(secondKey) || "Account 2";
-
-  userStates.delete(userId);
-
-  await ctx.editMessageText(
-    `👥 <b>Chat in Group</b>\n\n` +
-    `🏠 Group: <b>${esc(group.subject)}</b>\n\n` +
-    `📱 <b>Account 1:</b> ${esc(acc1)}\n` +
-    `📱 <b>Account 2:</b> ${esc(acc2)}\n\n` +
-    `Ye dono accounts is group mein funny, education, exam aur school/college se related messages bhejte rahenge.\n\n` +
-    `⏱️ Har ~30 seconds mein ek message jayega.\n\n` +
-    `Start karne ke liye confirm karo:`,
-    {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard()
-        .text("▶️ Start Group Chat", `ac_start_group_${group.id.replace("@", "_")}`)
-        .text("❌ Cancel", "main_menu"),
-    }
-  );
-});
-
-bot.callbackQuery("ac_grp_page", async (ctx) => { await ctx.answerCallbackQuery(); });
-
-bot.callbackQuery(["ac_grp_prev", "ac_grp_next"], async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  const state = userStates.get(userId);
-  if (!state?.removeData) return;
-
-  const allGroups = state.removeData.allGroups;
-  const PAGE_SIZE = 20;
-  const totalPages = Math.ceil(allGroups.length / PAGE_SIZE);
-  const isNext = ctx.callbackQuery.data === "ac_grp_next";
-  const currentPage = state.removeData.page || 0;
-  const newPage = isNext ? Math.min(currentPage + 1, totalPages - 1) : Math.max(currentPage - 1, 0);
-  state.removeData.page = newPage;
-
-  const start = newPage * PAGE_SIZE;
-  const end = Math.min(start + PAGE_SIZE, allGroups.length);
-
-  const kb = new InlineKeyboard();
-  for (let i = start; i < end; i++) {
-    kb.text(allGroups[i].subject, `ac_grp_${i}`).row();
-  }
-  if (totalPages > 1) {
-    kb.text("⬅️ Prev", "ac_grp_prev").text(`📄 ${newPage + 1}/${totalPages}`, "ac_grp_page").text("Next ➡️", "ac_grp_next").row();
-  }
-  kb.text("🔙 Back", "auto_chat");
-
-  await ctx.editMessageText(
-    `👥 <b>Group Select Karo</b>\n\n📊 Common groups: <b>${allGroups.length}</b>\n\nJis group mein chat karna hai woh select karo:`,
-    { parse_mode: "HTML", reply_markup: kb }
-  );
-});
-
-bot.callbackQuery("ac_start_friend", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-
-  const secondKey = `second_${userId}`;
-  if (!isConnected(String(userId)) || !isConnected(secondKey)) {
-    await ctx.editMessageText("❌ Both WhatsApp accounts must be connected.", {
-      reply_markup: new InlineKeyboard().text("🔙 Back", "auto_chat"),
-    }); return;
-  }
-
-  const existing = autoChatSessions.get(userId);
-  if (existing?.active) {
-    clearAutoChatTimer(existing);
-    existing.active = false;
-  }
-
-  const chatId = ctx.callbackQuery.message!.chat.id;
-  const msgId = ctx.callbackQuery.message!.message_id;
-
-  const session: AutoChatSession = {
-    userId1: String(userId),
-    userId2: secondKey,
-    mode: "friend",
-    active: true,
-    msgCount1: 0,
-    msgCount2: 0,
-    nextDelayMs: getRandomAutoChatDelayMs(),
-    turn: 0,
-    chatId,
-    statusMsgId: msgId,
-  };
-
-  autoChatSessions.set(userId, session);
-
-  await ctx.editMessageText(autoChatStatusText(session), {
-    parse_mode: "HTML",
-    reply_markup: autoChatRunningKeyboard(),
-  });
-
-  const num1 = getConnectedWhatsAppNumber(String(userId));
-  const num2 = getConnectedWhatsAppNumber(secondKey);
-
-  if (!num1 || !num2) {
-    await bot.api.editMessageText(chatId, msgId, "❌ Phone numbers could not be detected. Please reconnect both accounts.", {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard().text("🏠 Menu", "main_menu"),
-    }).catch(() => {});
-    session.active = false;
-    autoChatSessions.delete(userId);
-    return;
-  }
-
-  const jid1 = `${num1.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
-  const jid2 = `${num2.replace(/[^0-9]/g, "")}@s.whatsapp.net`;
-
-  scheduleAutoChatMessage(userId, async (sess) => {
-    const msg = getRandomMessage();
-    try {
-      if ((sess.turn || 0) % 2 === 0) {
-        const sock1 = getSession(sess.userId1)?.socket;
-        if (sock1) { await sock1.sendMessage(jid2, { text: msg }); sess.msgCount1++; }
-      } else {
-        const sock2 = getSession(sess.userId2)?.socket;
-        if (sock2) { await sock2.sendMessage(jid1, { text: msg }); sess.msgCount2++; }
-      }
-      sess.turn = (sess.turn || 0) + 1;
-    } catch (err: any) {
-      console.error("[AUTO_CHAT] Send error:", err?.message);
-    }
-  });
-});
-
-async function startGroupAutoChat(ctx: any, userId: number, selectedGroups: Array<{ id: string; subject: string }>): Promise<void> {
-  const secondKey = `second_${userId}`;
-  if (!isConnected(String(userId)) || !isConnected(secondKey)) {
-    await ctx.editMessageText("❌ Both WhatsApp accounts must be connected.", {
-      reply_markup: new InlineKeyboard().text("🔙 Back", "auto_chat"),
-    });
-    return;
-  }
-  const existing = autoChatSessions.get(userId);
-  if (existing?.active) {
-    clearAutoChatTimer(existing);
-    existing.active = false;
-  }
-
-  const chatId = ctx.callbackQuery.message!.chat.id;
-  const msgId = ctx.callbackQuery.message!.message_id;
-  const groups = selectedGroups.length ? selectedGroups : [{ id: "", subject: "Selected Group" }];
-
-  const session: AutoChatSession = {
-    userId1: String(userId),
-    userId2: secondKey,
-    mode: "group",
-    groupId: groups[0].id,
-    groupName: groups[0].subject,
-    groupIds: groups.map((group) => group.id),
-    groupNames: groups.map((group) => group.subject),
-    active: true,
-    msgCount1: 0,
-    msgCount2: 0,
-    nextDelayMs: getRandomAutoChatDelayMs(),
-    currentGroupIndex: 0,
-    turn: 0,
-    chatId,
-    statusMsgId: msgId,
-  };
-
-  autoChatSessions.set(userId, session);
-
-  await ctx.editMessageText(autoChatStatusText(session), {
-    parse_mode: "HTML",
-    reply_markup: autoChatRunningKeyboard(),
-  });
-
-  scheduleAutoChatMessage(userId, async (sess) => {
-    const groupIds = sess.groupIds?.length ? sess.groupIds : [sess.groupId!];
-    const groupIndex = Math.floor((sess.turn || 0) / 2) % groupIds.length;
-    const groupId = groupIds[groupIndex];
-    sess.currentGroupIndex = groupIndex;
-    const msg = getRandomMessage();
-    try {
-      if ((sess.turn || 0) % 2 === 0) {
-        const sock1 = getSession(sess.userId1)?.socket;
-        if (sock1) { await sock1.sendMessage(groupId, { text: msg }); sess.msgCount1++; }
-      } else {
-        const sock2 = getSession(sess.userId2)?.socket;
-        if (sock2) { await sock2.sendMessage(groupId, { text: msg }); sess.msgCount2++; }
-      }
-      sess.turn = (sess.turn || 0) + 1;
-      sess.currentGroupIndex = Math.floor((sess.turn || 0) / 2) % groupIds.length;
-    } catch (err: any) {
-      console.error("[AUTO_CHAT_GROUP] Send error:", err?.message);
-    }
-  });
-}
-
-bot.callbackQuery("ac_start_groups_selected", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-  const state = userStates.get(userId);
-  const selectedGroups = state?.removeData?.allGroups || [];
-  userStates.delete(userId);
-  await startGroupAutoChat(ctx, userId, selectedGroups);
-});
-
-bot.callbackQuery(/^ac_start_group_(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  if (!(await checkAccessMiddleware(ctx))) return;
-
-  const rawGroupId = ctx.match![1].replace(/_/g, "@");
-  const groupId = rawGroupId.includes("@g.us") ? rawGroupId : rawGroupId.replace("@g.us", "") + "@g.us";
-  const groups = await getAllGroups(String(userId));
-  const group = groups.find(g => g.id === groupId) || { id: groupId, subject: "Selected Group" };
-  await startGroupAutoChat(ctx, userId, [group]);
-});
-
-bot.callbackQuery("ac_stop_request", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  const userId = ctx.from.id;
-  await ctx.editMessageText(
-    "⚠️ <b>Stop Auto Chat?</b>\n\nAll messages sent so far are already delivered. Are you sure you want to stop?",
-    {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard()
-        .text("✅ Yes, Stop", "ac_stop_confirm")
-        .text("▶️ Keep Running", "ac_stop_cancel"),
-    }
-  );
-});
-
-bot.callbackQuery("ac_stop_confirm", async (ctx) => {
-  await ctx.answerCallbackQuery({ text: "⛔ Stopping Auto Chat..." });
-  const userId = ctx.from.id;
-  const session = autoChatSessions.get(userId);
-  if (session) {
-    session.active = false;
-    clearAutoChatTimer(session);
-    autoChatSessions.delete(userId);
-  }
-  await ctx.editMessageText(
-    `⛔ <b>Auto Chat Stopped</b>\n\n` +
-    `📊 <b>Final Count:</b>\n` +
-    `📱 Account 1: <b>${session?.msgCount1 || 0}</b> messages\n` +
-    `📱 Account 2: <b>${session?.msgCount2 || 0}</b> messages\n` +
-    `📨 Total: <b>${(session?.msgCount1 || 0) + (session?.msgCount2 || 0)}</b> messages`,
-    {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard().text("💬 Auto Chat Again", "auto_chat").text("🏠 Menu", "main_menu"),
-    }
-  );
-});
-
-bot.callbackQuery("ac_stop_cancel", async (ctx) => {
-  await ctx.answerCallbackQuery({ text: "▶️ Auto Chat is still running." });
-  const userId = ctx.from.id;
-  const session = autoChatSessions.get(userId);
-  if (!session || !session.active) {
-    await ctx.editMessageText("⚠️ Session not found. Please start Auto Chat again.", {
-      reply_markup: new InlineKeyboard().text("💬 Auto Chat", "auto_chat").text("🏠 Menu", "main_menu"),
-    }); return;
-  }
-  await ctx.editMessageText(autoChatStatusText(session), {
-    parse_mode: "HTML",
-    reply_markup: autoChatRunningKeyboard(),
-  });
 });
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
