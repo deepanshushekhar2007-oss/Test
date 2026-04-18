@@ -514,6 +514,10 @@ function formatDelay(ms: number): string {
   return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} hour${hours === 1 ? "" : "s"}`;
 }
 
+function isSessionActive(session: { cancelled: boolean; running: boolean }): boolean {
+  return !session.cancelled && session.running;
+}
+
 async function waitWithCancel(session: { cancelled: boolean; running: boolean }, delayMs: number): Promise<void> {
   const stepMs = 5000;
   let waited = 0;
@@ -3796,6 +3800,7 @@ async function runGroupChatDualBackground(
       const ok = await sendGroupMessage(senderUserId, group.id, message);
       if (ok) session.sent++; else session.failed++;
 
+      session.nextDelayMs = pickAutoDelayMs("group");
       try {
         await bot.api.editMessageText(chatId, msgId, cigProgressText(session), {
           parse_mode: "HTML",
@@ -3806,18 +3811,21 @@ async function runGroupChatDualBackground(
         });
       } catch {}
 
+      if (!isSessionActive(session)) break;
+      await waitWithCancel(session, session.nextDelayMs);
+      if (!isSessionActive(session)) break;
+
       groupIndex = (groupIndex + 1) % groups.length;
       messageIndex++;
       senderIndex++;
       session.currentGroupIndex = groupIndex;
-      session.nextDelayMs = pickAutoDelayMs("group");
-      if (!session.cancelled) await waitWithCancel(session, session.nextDelayMs);
     }
   } catch (err: any) {
     console.error(`[ACIG][${userId}] Error:`, err?.message);
   }
 
   session.running = false;
+  session.nextDelayMs = 0;
   if (!session.cancelled) {
     try {
       await bot.api.editMessageText(chatId, msgId,
@@ -3891,6 +3899,18 @@ bot.callbackQuery("acf_start", async (ctx) => {
   await ctx.answerCallbackQuery();
   const userId = ctx.from.id;
   if (!(await checkAccessMiddleware(ctx))) return;
+  const existingSession = acfSessions.get(userId);
+  if (existingSession?.running) {
+    await ctx.editMessageText(acfProgressText(existingSession), {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("🔄 Refresh", "acf_refresh")
+        .text("⏹️ Stop", "acf_stop_btn").row()
+        .text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+  if (existingSession) acfSessions.delete(userId);
   if (!isAutoConnected(String(userId))) {
     await ctx.editMessageText("❌ Auto Chat WA connected nahi hai.", {
       reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
@@ -3974,6 +3994,7 @@ async function runChatFriendBackground(
 
       const ok1 = await sendGroupMessage(primaryUserId, autoJid, msg1);
       if (ok1) session.sent++; else session.failed++;
+      session.nextDelayMs = pickAutoDelayMs("friend");
 
       try {
         await bot.api.editMessageText(chatId, msgId, acfProgressText(session), {
@@ -3985,12 +4006,13 @@ async function runChatFriendBackground(
         });
       } catch {}
 
-      if (session.cancelled) break;
-      session.nextDelayMs = pickAutoDelayMs("friend");
+      if (!isSessionActive(session)) break;
       await waitWithCancel(session, session.nextDelayMs);
+      if (!isSessionActive(session)) break;
 
       const ok2 = await sendGroupMessage(autoUserId, primaryJid, msg2);
       if (ok2) session.sent++; else session.failed++;
+      session.nextDelayMs = pickAutoDelayMs("friend");
 
       try {
         await bot.api.editMessageText(chatId, msgId, acfProgressText(session), {
@@ -4002,10 +4024,10 @@ async function runChatFriendBackground(
         });
       } catch {}
 
-      if (!session.cancelled) {
-        session.nextDelayMs = pickAutoDelayMs("friend");
+      if (isSessionActive(session)) {
         await waitWithCancel(session, session.nextDelayMs);
       }
+      if (!isSessionActive(session)) break;
       i++;
     }
   } catch (err: any) {
@@ -4013,6 +4035,7 @@ async function runChatFriendBackground(
   }
 
   session.running = false;
+  session.nextDelayMs = 0;
   if (!session.cancelled) {
     try {
       await bot.api.editMessageText(chatId, msgId,
