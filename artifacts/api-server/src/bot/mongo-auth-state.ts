@@ -90,7 +90,7 @@ export async function useMongoDBAuthState(userId: string) {
   );
 
   const readCreds = async () => {
-    const doc = await credsCollection.findOne({ _id: userId });
+    const doc = await credsCollection.findOne({ _id: userId as any });
     if (doc && doc.creds) {
       return deserialize(doc.creds);
     }
@@ -100,7 +100,7 @@ export async function useMongoDBAuthState(userId: string) {
   const saveCreds = async (creds: any) => {
     const serialized = serialize(creds);
     await credsCollection.updateOne(
-      { _id: userId },
+      { _id: userId as any },
       { $set: { userId, creds: serialized, updatedAt: new Date() } },
       { upsert: true }
     );
@@ -199,7 +199,7 @@ export async function listStoredWhatsAppSessions(): Promise<Array<{ userId: stri
 export async function clearMongoSession(userId: string): Promise<void> {
   const credsCollection = await getCollection("wa_creds");
   const keysCollection = await getCollection("wa_keys");
-  await credsCollection.deleteOne({ _id: userId });
+  await credsCollection.deleteOne({ _id: userId as any });
   await keysCollection.deleteMany({ userId });
   console.log(`[MongoDB] Cleared session for user: ${userId}`);
 }
