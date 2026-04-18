@@ -24,6 +24,7 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - Chat Friend now runs continuously until stopped and uses random delay rotation across 10 seconds, 1 minute, 10 minutes, 20 minutes, 30 minutes, 1 hour, and 2 hours.
 - Chat Friend stop now cancels any pending delay before another message can be sent, and the status message shows the next delay immediately.
 - Group Auto Chat no longer asks for a manual message; it rotates funny/study messages across all selected common groups until stopped, with 5 minutes to 2 hours random delay rotation.
+- `/help` now includes the Auto Chat feature, covering 2nd WhatsApp setup, Chat Friend, group rotation, delay rotation, live status, refresh, and stop controls.
 - Auto Chat bot screens and `/help` copy are in English while WhatsApp auto-chat messages remain Hinglish/original.
 
 ## Key Commands

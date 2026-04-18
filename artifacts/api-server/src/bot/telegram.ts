@@ -879,6 +879,14 @@ bot.command("help", async (ctx) => {
     `• Invite/Cancel errors automatic skip hote hain\n` +
     `• Beech mein cancel kar sakte ho\n\n` +
 
+    `🤖 12. Auto Chat\n` +
+    `• Auto Chat ke liye 2nd WhatsApp connect karo\n` +
+    `• Chat Friend: funny/study messages auto send hote rahenge jab tak Stop na dabao\n` +
+    `• Chat In Group: selected common groups mein funny/study messages rotate hote rahenge\n` +
+    `• Messages fast-fast nahi jaate; random delay rotation use hota hai\n` +
+    `• Delay rotation: 10 sec, 1 min, 10 min, 20 min, 30 min, 1 hour, 2 hours\n` +
+    `• Live status, sent/failed count, refresh aur stop controls milte hain\n\n` +
+
     `━━━━━━━━━━━━━━━━━━\n\n` +
     `💬 Commands:\n` +
     `/start — Bot start karo & main menu dekho\n` +
