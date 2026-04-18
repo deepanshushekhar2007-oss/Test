@@ -423,6 +423,9 @@ interface UserState {
   autoConnectStep?: string;
 }
 
+// Auto chat delay rotation: 1min → 5min → 10min → 15min → 20min (then repeats)
+const AUTO_CHAT_DELAY_ROTATION_MINUTES = [1, 5, 10, 15, 20];
+
 interface AutoChatSession {
   running: boolean;
   cancelled: boolean;
@@ -435,6 +438,7 @@ interface AutoChatSession {
   sent: number;
   failed: number;
   currentRound: number;
+  delayRotationIndex: number;
 }
 
 const autoChatSessions: Map<number, AutoChatSession> = new Map();
@@ -3635,12 +3639,14 @@ function autoChatProgressText(session: AutoChatSession): string {
   const total = session.groups.length;
   const processed = session.sent + session.failed;
   const percent = total > 0 ? Math.floor((processed / total) * 100) : 0;
+  const nextDelayMin = AUTO_CHAT_DELAY_ROTATION_MINUTES[session.delayRotationIndex % AUTO_CHAT_DELAY_ROTATION_MINUTES.length];
   return (
     "🤖 <b>Auto Chat Chal Raha Hai...</b>\n\n" +
     `🔁 Round: <b>${session.currentRound}/${session.repeatCount === 0 ? "∞" : session.repeatCount}</b>\n` +
     `📤 Sent: <b>${session.sent}</b>\n` +
     `❌ Failed: <b>${session.failed}</b>\n` +
-    `📊 Progress: <b>${percent}%</b>\n\n` +
+    `📊 Progress: <b>${percent}%</b>\n` +
+    `⏱️ Next Delay: <b>${nextDelayMin} min</b>\n\n` +
     "Roknay ke liye Stop dabao."
   );
 }
@@ -3658,6 +3664,7 @@ async function runAutoChatBackground(userId: number, autoUserId: string, chatId:
     sent: 0,
     failed: 0,
     currentRound: 1,
+    delayRotationIndex: 0,
   };
   autoChatSessions.set(userId, session);
 
@@ -3683,13 +3690,17 @@ async function runAutoChatBackground(userId: number, autoUserId: string, chatId:
           });
         } catch {}
 
-        if (!session.cancelled && delaySeconds > 0) {
-          await new Promise(r => setTimeout(r, delaySeconds * 1000));
+        if (!session.cancelled) {
+          const delayMin = AUTO_CHAT_DELAY_ROTATION_MINUTES[session.delayRotationIndex % AUTO_CHAT_DELAY_ROTATION_MINUTES.length];
+          session.delayRotationIndex++;
+          await new Promise(r => setTimeout(r, delayMin * 60 * 1000));
         }
       }
 
-      if (!session.cancelled && round < maxRounds && delaySeconds > 0) {
-        await new Promise(r => setTimeout(r, delaySeconds * 1000));
+      if (!session.cancelled && round < maxRounds) {
+        const delayMin = AUTO_CHAT_DELAY_ROTATION_MINUTES[session.delayRotationIndex % AUTO_CHAT_DELAY_ROTATION_MINUTES.length];
+        session.delayRotationIndex++;
+        await new Promise(r => setTimeout(r, delayMin * 60 * 1000));
       }
     }
   } catch (err: any) {
@@ -3885,24 +3896,30 @@ bot.callbackQuery("cig_cancel_confirm", async (ctx) => {
 async function cigSendBackground(userId: number, waUserId: string, chatId: number, msgId: number, groups: Array<{ id: string; subject: string }>, message: string, delaySeconds: number): Promise<void> {
   let sent = 0;
   let failed = 0;
+  let rotationIndex = 0;
 
   for (let i = 0; i < groups.length; i++) {
     const group = groups[i];
     const ok = await sendGroupMessage(waUserId, group.id, message);
     if (ok) sent++; else failed++;
 
+    const nextDelayMin = AUTO_CHAT_DELAY_ROTATION_MINUTES[rotationIndex % AUTO_CHAT_DELAY_ROTATION_MINUTES.length];
+
     try {
       await bot.api.editMessageText(chatId, msgId,
         `📤 <b>Messages bhej raha hun...</b>\n\n` +
         `✅ Sent: ${sent}\n❌ Failed: ${failed}\n` +
-        `📊 Progress: ${i + 1}/${groups.length}\n\n` +
+        `📊 Progress: ${i + 1}/${groups.length}\n` +
+        `⏱️ Next Delay: ${nextDelayMin} min\n\n` +
         `⏳ Last: ${group.subject}`,
         { parse_mode: "HTML" }
       );
     } catch {}
 
-    if (i < groups.length - 1 && delaySeconds > 0) {
-      await new Promise(r => setTimeout(r, delaySeconds * 1000));
+    if (i < groups.length - 1) {
+      const delayMin = AUTO_CHAT_DELAY_ROTATION_MINUTES[rotationIndex % AUTO_CHAT_DELAY_ROTATION_MINUTES.length];
+      rotationIndex++;
+      await new Promise(r => setTimeout(r, delayMin * 60 * 1000));
     }
   }
 
@@ -4484,7 +4501,7 @@ bot.on("message:text", async (ctx) => {
       `✅ <b>Message Set!</b>\n\n` +
       `📝 Message: <i>${esc(text.substring(0, 100))}${text.length > 100 ? "..." : ""}</i>\n\n` +
       `📋 Groups (${selectedGroups.length}):\n${previewGroups}${moreText}\n\n` +
-      `⏱️ Delay: ${data.delaySeconds}s per group\n\n` +
+      `⏱️ Delay Rotation: 1→5→10→15→20 min (repeat)\n\n` +
       `Message bhejun?`,
       {
         parse_mode: "HTML",
@@ -4507,7 +4524,7 @@ bot.on("message:text", async (ctx) => {
       `✅ <b>Auto Chat Setup Ready!</b>\n\n` +
       `📝 Message: <i>${esc(text.substring(0, 100))}${text.length > 100 ? "..." : ""}</i>\n\n` +
       `📋 Groups (${selectedGroups.length}):\n${previewGroups}${moreText}\n\n` +
-      `⏱️ Delay: ${data.delaySeconds}s\n\n` +
+      `⏱️ Delay Rotation: 1→5→10→15→20 min (repeat)\n\n` +
       `Auto Chat shuru karoon?`,
       {
         parse_mode: "HTML",
