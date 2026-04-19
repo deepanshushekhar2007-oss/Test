@@ -436,6 +436,7 @@ interface AutoChatSession {
   sent: number;
   failed: number;
   currentRound: number;
+  rotationIndex: number;
 }
 
 interface CigSession {
@@ -451,6 +452,7 @@ interface CigSession {
   currentGroupIndex: number;
   cycle: number;
   nextDelayMs: number;
+  rotationIndex: number;
 }
 
 interface AcfSession {
@@ -466,6 +468,7 @@ interface AcfSession {
   totalPairs: number;
   cycle: number;
   nextDelayMs: number;
+  rotationIndex: number;
 }
 
 const CHAT_FRIEND_PAIRS: [string, string][] = [
@@ -481,30 +484,19 @@ const CHAT_FRIEND_PAIRS: [string, string][] = [
   ["Chal coffee peete hain baad mein?", "Haan bilkul! 3 baje canteen chalte hain ✅"],
 ];
 
-const CHAT_FRIEND_DELAY_ROTATION_MS = [
-  10 * 1000,
-  60 * 1000,
-  10 * 60 * 1000,
-  20 * 60 * 1000,
-  30 * 60 * 1000,
-  60 * 60 * 1000,
-  2 * 60 * 60 * 1000,
-];
-
-const GROUP_CHAT_DELAY_ROTATION_MS = [
+// Sequential delay rotation: 1min → 5min → 10min → 15min → 20min → repeat (max 20 min)
+const CHAT_DELAY_ROTATION_MS = [
+  1 * 60 * 1000,
   5 * 60 * 1000,
   10 * 60 * 1000,
+  15 * 60 * 1000,
   20 * 60 * 1000,
-  30 * 60 * 1000,
-  60 * 60 * 1000,
-  2 * 60 * 60 * 1000,
 ];
 
 const AUTO_GROUP_MESSAGES = CHAT_FRIEND_PAIRS.flat();
 
-function pickAutoDelayMs(mode: "friend" | "group"): number {
-  const delays = mode === "friend" ? CHAT_FRIEND_DELAY_ROTATION_MS : GROUP_CHAT_DELAY_ROTATION_MS;
-  return delays[Math.floor(Math.random() * delays.length)];
+function getSequentialDelayMs(rotationIndex: number): number {
+  return CHAT_DELAY_ROTATION_MS[rotationIndex % CHAT_DELAY_ROTATION_MS.length];
 }
 
 function formatDelay(ms: number): string {
@@ -3803,6 +3795,7 @@ async function runGroupChatDualBackground(
     currentGroupIndex: 0,
     cycle: 1,
     nextDelayMs: 0,
+    rotationIndex: 0,
   };
   cigSessions.set(userId, session);
 
@@ -3823,7 +3816,8 @@ async function runGroupChatDualBackground(
       const ok = await sendGroupMessage(senderUserId, group.id, message);
       if (ok) session.sent++; else session.failed++;
 
-      session.nextDelayMs = pickAutoDelayMs("group");
+      session.nextDelayMs = getSequentialDelayMs(session.rotationIndex);
+      session.rotationIndex++;
       try {
         await bot.api.editMessageText(chatId, msgId, cigProgressText(session), {
           parse_mode: "HTML",
@@ -4003,6 +3997,7 @@ async function runChatFriendBackground(
     totalPairs,
     cycle: 1,
     nextDelayMs: 0,
+    rotationIndex: 0,
   };
   acfSessions.set(userId, session);
 
@@ -4017,7 +4012,8 @@ async function runChatFriendBackground(
 
       const ok1 = await sendGroupMessage(primaryUserId, autoJid, msg1);
       if (ok1) session.sent++; else session.failed++;
-      session.nextDelayMs = pickAutoDelayMs("friend");
+      session.nextDelayMs = getSequentialDelayMs(session.rotationIndex);
+      session.rotationIndex++;
 
       try {
         await bot.api.editMessageText(chatId, msgId, acfProgressText(session), {
@@ -4035,7 +4031,8 @@ async function runChatFriendBackground(
 
       const ok2 = await sendGroupMessage(autoUserId, primaryJid, msg2);
       if (ok2) session.sent++; else session.failed++;
-      session.nextDelayMs = pickAutoDelayMs("friend");
+      session.nextDelayMs = getSequentialDelayMs(session.rotationIndex);
+      session.rotationIndex++;
 
       try {
         await bot.api.editMessageText(chatId, msgId, acfProgressText(session), {
@@ -4155,6 +4152,7 @@ async function runAutoChatBackground(userId: number, autoUserId: string, chatId:
     sent: 0,
     failed: 0,
     currentRound: 1,
+    rotationIndex: 0,
   };
   autoChatSessions.set(userId, session);
 
@@ -4170,6 +4168,9 @@ async function runAutoChatBackground(userId: number, autoUserId: string, chatId:
         const ok = await sendGroupMessage(autoUserId, group.id, message);
         if (ok) session.sent++; else session.failed++;
 
+        const delayMs = getSequentialDelayMs(session.rotationIndex);
+        session.rotationIndex++;
+
         try {
           await bot.api.editMessageText(chatId, msgId, autoChatProgressText(session), {
             parse_mode: "HTML",
@@ -4180,13 +4181,15 @@ async function runAutoChatBackground(userId: number, autoUserId: string, chatId:
           });
         } catch {}
 
-        if (!session.cancelled && delaySeconds > 0) {
-          await new Promise(r => setTimeout(r, delaySeconds * 1000));
+        if (!session.cancelled) {
+          await waitWithCancel(session, delayMs);
         }
       }
 
-      if (!session.cancelled && round < maxRounds && delaySeconds > 0) {
-        await new Promise(r => setTimeout(r, delaySeconds * 1000));
+      if (!session.cancelled && round < maxRounds) {
+        const delayMs = getSequentialDelayMs(session.rotationIndex);
+        session.rotationIndex++;
+        await waitWithCancel(session, delayMs);
       }
     }
   } catch (err: any) {
@@ -4391,42 +4394,59 @@ async function cigSendBackground(userId: number, waUserId: string, chatId: numbe
     currentGroupIndex: 0,
     cycle: 1,
     nextDelayMs: 0,
+    rotationIndex: 0,
   };
   cigSessions.set(userId, session);
 
-  for (let i = 0; i < groups.length; i++) {
-    if (session.cancelled) break;
-    const group = groups[i];
-    session.currentGroupIndex = i;
-    const ok = await sendGroupMessage(waUserId, group.id, message);
-    if (ok) session.sent++; else session.failed++;
+  try {
+    let groupIndex = 0;
+    while (!session.cancelled && session.running) {
+      if (!groups.length) break;
+      const group = groups[groupIndex];
+      session.currentGroupIndex = groupIndex;
+      session.cycle = Math.floor(session.sent / groups.length) + 1;
 
-    try {
-      await bot.api.editMessageText(chatId, msgId,
-        `📤 <b>Messages bhej raha hun...</b>\n\n` +
-        `✅ Sent: ${session.sent}\n❌ Failed: ${session.failed}\n` +
-        `📊 Progress: ${i + 1}/${groups.length}\n\n` +
-        `⏳ Last: ${esc(group.subject)}`,
-        {
-          parse_mode: "HTML",
-          reply_markup: new InlineKeyboard()
-            .text("🔄 Refresh", "cig_refresh")
-            .text("⏹️ Stop", "cig_stop_btn").row()
-            .text("🏠 Main Menu", "main_menu"),
-        }
-      );
-    } catch {}
+      const ok = await sendGroupMessage(waUserId, group.id, message);
+      if (ok) session.sent++; else session.failed++;
 
-    if (!session.cancelled && i < groups.length - 1 && delaySeconds > 0) {
-      await new Promise(r => setTimeout(r, delaySeconds * 1000));
+      session.nextDelayMs = getSequentialDelayMs(session.rotationIndex);
+      session.rotationIndex++;
+
+      try {
+        await bot.api.editMessageText(chatId, msgId,
+          `📤 <b>Messages bhej raha hun...</b>\n\n` +
+          `✅ Sent: ${session.sent}\n❌ Failed: ${session.failed}\n` +
+          `🔁 Cycle: ${session.cycle}\n` +
+          `📊 Group: ${groupIndex + 1}/${groups.length}\n` +
+          `⏱️ Next Delay: <b>${formatDelay(session.nextDelayMs)}</b>\n` +
+          `⏳ Last: ${esc(group.subject)}\n\n` +
+          `Press Stop to end it.`,
+          {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🔄 Refresh", "cig_refresh")
+              .text("⏹️ Stop", "cig_stop_btn").row()
+              .text("🏠 Main Menu", "main_menu"),
+          }
+        );
+      } catch {}
+
+      if (!isSessionActive(session)) break;
+      await waitWithCancel(session, session.nextDelayMs);
+      if (!isSessionActive(session)) break;
+
+      groupIndex = (groupIndex + 1) % groups.length;
     }
+  } catch (err: any) {
+    console.error(`[CIG_SINGLE][${userId}] Error:`, err?.message);
   }
 
   session.running = false;
+  session.nextDelayMs = 0;
   if (!session.cancelled) {
     try {
       await bot.api.editMessageText(chatId, msgId,
-        `✅ <b>Done!</b>\n\n📤 Sent: ${session.sent}\n❌ Failed: ${session.failed}\n📊 Total: ${groups.length} groups`,
+        `✅ <b>Chat In Group Band!</b>\n\n📤 Sent: ${session.sent}\n❌ Failed: ${session.failed}\n📊 Groups: ${groups.length}`,
         { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
       );
     } catch {}
