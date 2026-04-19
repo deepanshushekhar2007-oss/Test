@@ -1,8 +1,9 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 import { startBot } from "./bot/telegram";
-import { restoreWhatsAppSessions } from "./bot/whatsapp";
+import { restoreWhatsAppSessions, getActiveSessionUserIds } from "./bot/whatsapp";
 import { getMongoDb, closeMongoDb } from "./bot/mongodb";
+import { cleanupStaleSessions } from "./bot/mongo-auth-state";
 import https from "https";
 import http from "http";
 
@@ -20,9 +21,33 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
+// Kitne din baad inactive session delete karna hai (default: 7 din)
+const STALE_SESSION_DAYS = Number(process.env["STALE_SESSION_DAYS"] || "7");
+
+async function runSessionCleanup(label: string): Promise<void> {
+  try {
+    const active = getActiveSessionUserIds();
+    const result = await cleanupStaleSessions(active, STALE_SESSION_DAYS);
+    if (result.deletedSessions > 0 || result.deletedKeys > 0) {
+      console.log(
+        `[${label}] Session cleanup: ${result.deletedSessions} stale sessions deleted ` +
+        `(${result.deletedUnpaired} unpaired), ${result.deletedKeys} keys freed from MongoDB`
+      );
+    } else {
+      console.log(`[${label}] Session cleanup: no stale sessions found`);
+    }
+  } catch (err: any) {
+    console.error(`[${label}] Session cleanup failed:`, err?.message);
+  }
+}
+
 async function main() {
   await getMongoDb();
   console.log("[INIT] MongoDB connected successfully");
+
+  // Stale sessions startup pe delete karo, uske baad active sessions restore karo
+  await runSessionCleanup("STARTUP");
+
   await restoreWhatsAppSessions();
 
   app.listen(port, (err) => {
@@ -33,6 +58,7 @@ async function main() {
 
     logger.info({ port }, "Server listening");
 
+    // Render free tier sleep na kare isliye ping
     const renderUrl = process.env["RENDER_EXTERNAL_URL"];
     if (renderUrl) {
       const pingUrl = `${renderUrl}/api/healthz`;
@@ -46,6 +72,11 @@ async function main() {
         });
       }, 10 * 60 * 1000);
     }
+
+    // Har 24 ghante mein auto cleanup chalao
+    setInterval(() => {
+      runSessionCleanup("DAILY-CLEANUP");
+    }, 24 * 60 * 60 * 1000);
   });
 
   startBot();
