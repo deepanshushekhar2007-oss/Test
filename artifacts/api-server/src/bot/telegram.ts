@@ -450,6 +450,8 @@ interface CigSession {
   message: string;
   sent: number;
   failed: number;
+  sentByAccount1: number;
+  sentByAccount2: number;
   botMode: "single" | "both";
   currentGroupIndex: number;
   cycle: number;
@@ -484,15 +486,39 @@ const CHAT_FRIEND_PAIRS: [string, string][] = [
   ["Bhai exam me kitna aaya?", "Puchh mat yaar... dard hota hai yaad karke 😂"],
   ["Tu serious kyun rehta hai har waqt?", "Serious nahi hoon yaar, bas aaj neend nahi aayi 😪"],
   ["Chal coffee peete hain baad mein?", "Haan bilkul! 3 baje canteen chalte hain ✅"],
+  ["Bhai teacher ne aaj class mein kya padha?", "Pata nahi yaar, main phone pe tha 😬"],
+  ["Tera homework hua kya?", "Homework? Wo toh kal subah 5 baje karenge jaise hamesha 😅"],
+  ["Yaar kitna bada syllabus hai is baar!", "Haan bhai, rona aa raha hai dekh ke 😭"],
+  ["Bhai galti se teacher ki aankhon mein dekh liya!", "Phir? Sun li lecture wali sirf tujhe hi? 😂"],
+  ["Kal result aane wala hai yaar...", "Main toh kal school nahi aaunga 😂 Chhup jaunga ghar pe"],
+  ["Yaar mera pen kho gaya phir se!", "Tera pen kho gaya ya tune diya kisi ko aur bhool gaya? 😏"],
+  ["Physics ka formula yaad nahi ho raha", "Tension mat le, exam mein bhi nahi hoga yaad 😂"],
+  ["Bhai library mein padhai hoti hai kya?", "Hoti toh hai... mujhe toh neend aati hai wahan 😴"],
+  ["Yaar group project mein mera koi kaam nahi kiya!", "Welcome to team work 😂"],
+  ["Teacher ne merit list nikaali, tera naam nahi tha!", "Iska matlab mujhe vacation ki zaroorat hai 😂"],
+  ["Bhai aaj phir bunk maara tune?", "Yaar attendance ki fikr mat kar, marks bhi nahi aate toh bhi 😂"],
+  ["Exam ke baad kya plan hai?", "Bhool ja sab aur so jaao teen din tak 😴"],
+  ["Yaar notes share kar na please!", "Mere notes? Main khud copy karta hoon tere notes se 😂"],
+  ["Bhai iss baar padhna hai seriously", "Haan same last baar bhi kaha tha, aur usse pehle bhi 😂"],
+  ["Canteen mein aaj noodles the kaafi acche!", "Tu canteen gaya? Mujhe bata toh deta yaar 😤"],
+  ["Yaar maths class mein so gaya tha", "Acha toh uss waqt main akela nahi tha 😴"],
+  ["Teacher ne mujhe pakad liya mobile pe!", "Mujhe bhi kal hi pakda... solidarity yaar 😂"],
+  ["Yaar padhai mein man nahi lagta", "Man kisi ka bhi nahi lagta, phir bhi karte hain 😅"],
+  ["Bhai principal office mein kyon bula rahe hain?", "Pray kar yaar aur sach mat bolna 😂"],
+  ["Teri girlfriend hai kya school mein?", "Haan, merī books... unse hi pyaar hai 😂"],
+  ["Yaar kal presentation hai, ready hai tu?", "Presentation? Kaun sa topic tha yaar 😅"],
+  ["Bhai aaj phir baarish mein bheega?", "Haan yaar, umbrella ghar pe hi reh gaya jaisa hamesha 😭"],
+  ["Yaar tere marks kitne aaye iss baar?", "Itne kam ki calculator se bhi nahi ginne 😂"],
+  ["Bhai chemistry experiment mein kuch jalaya tune!", "Sirf thoda sa... science toh yahi hota hai na 😂"],
 ];
 
-// Sequential delay rotation: 1min → 5min → 10min → 15min → 20min → repeat (max 20 min)
+// Sequential delay rotation: 1min → 2min → 3min → 4min → 5min → repeat
 const CHAT_DELAY_ROTATION_MS = [
   1 * 60 * 1000,
+  2 * 60 * 1000,
+  3 * 60 * 1000,
+  4 * 60 * 1000,
   5 * 60 * 1000,
-  10 * 60 * 1000,
-  15 * 60 * 1000,
-  20 * 60 * 1000,
 ];
 
 const AUTO_GROUP_MESSAGES = CHAT_FRIEND_PAIRS.flat();
@@ -530,6 +556,7 @@ const userStates: Map<number, UserState> = new Map();
 const joinCancelRequests: Set<number> = new Set();
 const getLinkCancelRequests: Set<number> = new Set();
 const addMembersCancelRequests: Set<number> = new Set();
+const removeMembersCancelRequests: Set<number> = new Set();
 
 const MA_PAGE_SIZE = 20;
 const PL_PAGE_SIZE = 20;
@@ -542,11 +569,13 @@ function pendingSumExpression(items: Array<{ pendingCount: number }>): string {
 }
 
 function pendingCopyText(title: string, items: Array<{ groupName: string; pendingCount: number }>): string {
+  // Sort A-Z by group name
+  const sorted = [...items].sort((a, b) => a.groupName.localeCompare(b.groupName));
   let text = `📋 <b>${esc(title)}</b>\n\n<pre>`;
-  for (const g of items) {
-    text += `${esc(g.groupName)} ✅ ${g.pendingCount}\n`;
+  for (const g of sorted) {
+    text += `${g.groupName} ✅ ${g.pendingCount}\n`;
   }
-  text += `\nTotal sum = ${pendingSumExpression(items)}`;
+  text += `\nTotal sum = ${pendingSumExpression(sorted)}`;
   text += `</pre>`;
   return text;
 }
@@ -964,8 +993,8 @@ bot.callbackQuery("pending_list", async (ctx) => {
     return;
   }
 
-  // Sort by pending count descending
-  pendingOnly.sort((a, b) => b.pendingCount - a.pendingCount);
+  // Sort alphabetically by group name (small to large)
+  pendingOnly.sort((a, b) => a.groupName.localeCompare(b.groupName));
 
   // Detect similar patterns from admin group names
   const groupsForPattern = pendingOnly.map((g) => ({ id: g.groupId, subject: g.groupName }));
@@ -2119,7 +2148,11 @@ function detectSimilarGroups(groups: Array<{ id: string; subject: string }>): Si
   }
   return Array.from(map.entries())
     .filter(([, items]) => items.length >= 2)
-    .map(([, items]) => ({ base: items[0].subject.replace(/\s*\d+\s*$/, "").trim(), groups: items }));
+    .map(([, items]) => {
+      const sorted = items.sort((a, b) => a.subject.localeCompare(b.subject));
+      return { base: sorted[0].subject.replace(/\s*\d+\s*$/, "").trim(), groups: sorted };
+    })
+    .sort((a, b) => a.base.localeCompare(b.base));
 }
 
 bot.callbackQuery("get_link", async (ctx) => {
@@ -2142,7 +2175,7 @@ bot.callbackQuery("get_link", async (ctx) => {
   }
 
   const adminGroups = groups.filter((g) => g.isAdmin);
-  const allGroupsSimple = adminGroups.map((g) => ({ id: g.id, subject: g.subject }));
+  const allGroupsSimple = adminGroups.map((g) => ({ id: g.id, subject: g.subject })).sort((a, b) => a.subject.localeCompare(b.subject));
   const patterns = detectSimilarGroups(allGroupsSimple);
 
   userStates.set(userId, {
@@ -2314,8 +2347,8 @@ async function fetchGroupLinksBackground(
 
   if (wasCancelled) result += "⛔ <b>Fetch stopped by user.</b>\n\n";
 
-  const successResults = results.filter((r) => r.link);
-  const failedResults = results.filter((r) => !r.link);
+  const successResults = results.filter((r) => r.link).sort((a, b) => a.subject.localeCompare(b.subject));
+  const failedResults = results.filter((r) => !r.link).sort((a, b) => a.subject.localeCompare(b.subject));
 
   for (const r of successResults) {
     result += `📌 ${esc(r.subject)}\n${r.link}\n\n`;
@@ -2644,6 +2677,28 @@ bot.callbackQuery("rm_skip_exclude", async (ctx) => {
   await startRemoveMembersProcess(ctx, userId, state.removeExcludeData.selectedGroups, new Set());
 });
 
+bot.callbackQuery("rm_cancel_request", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageReplyMarkup({
+    reply_markup: new InlineKeyboard()
+      .text("✅ Yes, Stop Removing", "rm_cancel_confirm")
+      .text("↩️ Continue", "rm_cancel_no"),
+  });
+});
+
+bot.callbackQuery("rm_cancel_no", async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "Removing continued" });
+  await ctx.editMessageReplyMarkup({
+    reply_markup: new InlineKeyboard().text("❌ Cancel", "rm_cancel_request"),
+  });
+});
+
+bot.callbackQuery("rm_cancel_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "Stopping after current member..." });
+  removeMembersCancelRequests.add(ctx.from.id);
+  await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+});
+
 async function startRemoveMembersProcess(
   ctx: any,
   userId: number,
@@ -2666,12 +2721,19 @@ async function startRemoveMembersProcess(
 
   try {
     if (msgId) {
-      await ctx.editMessageText(statusText, { parse_mode: "HTML" });
+      await ctx.editMessageText(statusText, {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard().text("❌ Cancel", "rm_cancel_request"),
+      });
     } else {
-      await ctx.reply(statusText, { parse_mode: "HTML" });
+      await ctx.reply(statusText, {
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard().text("❌ Cancel", "rm_cancel_request"),
+      });
     }
   } catch {}
 
+  removeMembersCancelRequests.delete(userId);
   void removeAllGroupMembersBackground(String(userId), selectedGroups, excludeList, chatId, msgId);
 }
 
@@ -2696,6 +2758,8 @@ async function removeAllGroupMembersBackground(
         );
       }
     } catch {}
+
+    if (removeMembersCancelRequests.has(Number(userId))) break;
 
     const participants = await getGroupParticipants(userId, group.id);
 
@@ -2722,7 +2786,9 @@ async function removeAllGroupMembersBackground(
     }
 
     let removed = 0, failed = 0;
+    let cancelledEarly = false;
     for (let pi = 0; pi < nonAdmins.length; pi++) {
+      if (removeMembersCancelRequests.has(Number(userId))) { cancelledEarly = true; break; }
       const p = nonAdmins[pi];
       const ok = await removeGroupParticipant(userId, group.id, p.jid);
       if (ok) removed++;
@@ -2734,7 +2800,7 @@ async function removeAllGroupMembersBackground(
           if (msgId) {
             await bot.api.editMessageText(chatId, msgId,
               `⏳ <b>Group ${gi + 1}/${groups.length}: ${esc(group.subject)}</b>\n\n🗑️ Removing: ${pi + 1}/${nonAdmins.length}\n✅ Removed: ${removed} | ❌ Failed: ${failed}`,
-              { parse_mode: "HTML" }
+              { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("❌ Cancel", "rm_cancel_request") }
             );
           }
         } catch {}
@@ -2745,9 +2811,14 @@ async function removeAllGroupMembersBackground(
 
     fullResult += `📋 <b>${esc(group.subject)}</b>\n`;
     fullResult += `🗑️ Removed: ${removed} | ❌ Failed: ${failed}\n\n`;
+    if (cancelledEarly) break;
   }
 
-  fullResult += `━━━━━━━━━━━━━━━━━━\n✅ <b>Done processing ${groups.length} group(s)!</b>`;
+  const wasCancelled = removeMembersCancelRequests.has(Number(userId));
+  removeMembersCancelRequests.delete(Number(userId));
+
+  if (wasCancelled) fullResult += `⛔ <b>Stopped by user.</b>\n\n`;
+  fullResult += `━━━━━━━━━━━━━━━━━━\n✅ <b>Done processing group(s)!</b>`;
 
   const chunks = splitMessage(fullResult, 4000);
   try {
@@ -3925,18 +3996,17 @@ bot.callbackQuery("acig_proceed", async (ctx) => {
 });
 
 function cigProgressText(session: CigSession): string {
-  const processed = session.sent + session.failed;
   const currentGroup = session.groups[session.currentGroupIndex]?.subject || session.groups[0]?.subject || "group";
   return (
-    "👥 <b>Chat In Group Running...</b>\n\n" +
-    `🔁 Cycle: <b>${session.cycle}</b>\n` +
-    `📍 Current Group: <b>${esc(currentGroup)}</b>\n` +
-    `📤 Sent: <b>${session.sent}</b>\n` +
-    `❌ Failed: <b>${session.failed}</b>\n` +
-    `📊 Total Tried: <b>${processed}</b>\n` +
-    (session.nextDelayMs > 0 ? `⏱️ Next Delay: <b>${formatDelay(session.nextDelayMs)}</b>\n` : "") +
-    (session.botMode === "both" ? "🤖 Both WA accounts are rotating\n" : "") +
-    "\nPress Stop to end it."
+    "🤖 <b>Auto Chat Running</b>\n\n" +
+    `📍 Mode: <b>Chat in Group</b>\n` +
+    `🎯 Target: <b>Group: ${esc(currentGroup)}</b>\n\n` +
+    `📊 <b>Messages Sent:</b>\n` +
+    `📱 Account 1: <b>${session.sentByAccount1} messages</b>\n` +
+    `📱 Account 2: <b>${session.sentByAccount2} messages</b>\n` +
+    `📩 Total: <b>${session.sent} messages</b>\n\n` +
+    (session.nextDelayMs > 0 ? `⏰ Sending every ~${formatDelay(session.nextDelayMs)}...\n` : "") +
+    "Press <b>Stop</b> to stop the chat."
   );
 }
 
@@ -3957,6 +4027,8 @@ async function runGroupChatDualBackground(
     message: "Auto funny/study rotation",
     sent: 0,
     failed: 0,
+    sentByAccount1: 0,
+    sentByAccount2: 0,
     botMode: "both",
     currentGroupIndex: 0,
     cycle: 1,
@@ -3974,33 +4046,45 @@ async function runGroupChatDualBackground(
       if (!groups.length) break;
       const group = groups[groupIndex];
       session.currentGroupIndex = groupIndex;
-      session.cycle = Math.floor(messageIndex / groups.length) + 1;
+      session.cycle = Math.floor(messageIndex / (groups.length * 2)) + 1;
       if (session.cancelled) break;
 
-      const senderUserId = senderIndex % 2 === 0 ? primaryUserId : autoUserId;
-      const message = AUTO_GROUP_MESSAGES[messageIndex % AUTO_GROUP_MESSAGES.length];
-      const ok = await sendGroupMessage(senderUserId, group.id, message);
-      if (ok) session.sent++; else session.failed++;
+      // Send 2 messages per group before rotating to next group
+      for (let msgInGroup = 0; msgInGroup < 2; msgInGroup++) {
+        if (!isSessionActive(session)) break;
 
-      session.nextDelayMs = getSequentialDelayMs(session.rotationIndex);
-      session.rotationIndex++;
-      try {
-        await bot.api.editMessageText(chatId, msgId, cigProgressText(session), {
-          parse_mode: "HTML",
-          reply_markup: new InlineKeyboard()
-            .text("🔄 Refresh", "cig_refresh")
-            .text("⏹️ Stop", "cig_stop_btn").row()
-            .text("🏠 Main Menu", "main_menu"),
-        });
-      } catch {}
+        const isAccount1 = senderIndex % 2 === 0;
+        const senderUserId = isAccount1 ? primaryUserId : autoUserId;
+        const message = AUTO_GROUP_MESSAGES[messageIndex % AUTO_GROUP_MESSAGES.length];
+        const ok = await sendGroupMessage(senderUserId, group.id, message);
+        if (ok) {
+          session.sent++;
+          if (isAccount1) session.sentByAccount1++; else session.sentByAccount2++;
+        } else session.failed++;
 
-      if (!isSessionActive(session)) break;
-      await waitWithCancel(session, session.nextDelayMs);
+        messageIndex++;
+        senderIndex++;
+        session.nextDelayMs = getSequentialDelayMs(session.rotationIndex);
+        session.rotationIndex++;
+
+        try {
+          await bot.api.editMessageText(chatId, msgId, cigProgressText(session), {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🔄 Refresh", "cig_refresh")
+              .text("⏹️ Stop", "cig_stop_btn").row()
+              .text("🏠 Main Menu", "main_menu"),
+          });
+        } catch {}
+
+        if (!isSessionActive(session)) break;
+        await waitWithCancel(session, session.nextDelayMs);
+        if (!isSessionActive(session)) break;
+      }
+
       if (!isSessionActive(session)) break;
 
       groupIndex = (groupIndex + 1) % groups.length;
-      messageIndex++;
-      senderIndex++;
       session.currentGroupIndex = groupIndex;
     }
   } catch (err: any) {
