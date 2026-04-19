@@ -31,6 +31,7 @@ import {
   getAutoUserId,
   isAutoConnected,
   getAutoConnectedNumber,
+  getActiveSessionUserIds,
 } from "./whatsapp";
 import { parseVCF, normalizePhone } from "./vcf-parser";
 import QRCode from "qrcode";
@@ -43,6 +44,7 @@ import {
   isUserBanned,
   hasUserAccess,
 } from "./mongo-bot-data";
+import { getSessionStats, cleanupStaleSessions } from "./mongo-auth-state";
 
 const token = process.env["TELEGRAM_BOT_TOKEN"] || "";
 
@@ -1172,7 +1174,13 @@ bot.command("admin", async (ctx) => {
     "🚫 <code>/ban [id]</code> — Ban a user\n" +
     "✅ <code>/unban [id]</code> — Unban a user\n" +
     "📢 <code>/broadcast [message]</code> — Send message to all users\n" +
-    "📊 <code>/status</code> — View bot statistics",
+    "📊 <code>/status</code> — View bot statistics
+" +
+    "📱 <code>/sessions</code> — WhatsApp sessions list
+" +
+    "🧠 <code>/memory</code> — Server RAM usage\n" +
+    "🧹 <code>/cleansessions</code> — Delete unused sessions",
+
     { parse_mode: "HTML" }
   );
 });
@@ -1291,6 +1299,111 @@ bot.command("status", async (ctx) => {
     { parse_mode: "HTML" }
   );
 });
+
+
+bot.command("sessions", async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) { await ctx.reply("🚫 You are not an admin."); return; }
+
+  await ctx.reply("⏳ <b>Fetching session info...</b>", { parse_mode: "HTML" });
+
+  try {
+    const stats = await getSessionStats();
+    const activeIds = getActiveSessionUserIds();
+
+    if (!stats.length) {
+      await ctx.reply("📭 <b>No WhatsApp sessions in MongoDB.</b>", { parse_mode: "HTML" });
+      return;
+    }
+
+    const now = new Date();
+    const staleDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    let text = `📱 <b>WhatsApp Sessions (${stats.length})</b>\n\n`;
+
+    for (const s of stats) {
+      const isLive = activeIds.has(s.userId);
+      const statusIcon = isLive ? "🟢" : s.registered ? "🔴" : "⚪";
+      const statusLabel = isLive ? "Live" : s.registered ? "Disconnected" : "Unpaired";
+      text += `${statusIcon} <b>${esc(s.phoneNumber)}</b>\n`;
+      text += `   Status: ${statusLabel}\n`;
+      text += `   Last seen: ${esc(s.lastSeen)}\n\n`;
+    }
+
+    const liveCount = stats.filter(s => activeIds.has(s.userId)).length;
+    const disconnectedCount = stats.filter(s => !activeIds.has(s.userId) && s.registered).length;
+    const unpairedCount = stats.filter(s => !s.registered).length;
+
+    text += `📊 <b>Summary:</b>\n`;
+    text += `  🟢 Live: ${liveCount}\n`;
+    text += `  🔴 Disconnected: ${disconnectedCount}\n`;
+    text += `  ⚪ Unpaired: ${unpairedCount}\n\n`;
+    text += `💡 Use /cleansessions to delete unused sessions`;
+
+    await ctx.reply(text, { parse_mode: "HTML" });
+  } catch (err: any) {
+    await ctx.reply(`❌ Error: ${esc(err?.message || "Unknown error")}`, { parse_mode: "HTML" });
+  }
+});
+
+bot.command("cleansessions", async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) { await ctx.reply("🚫 You are not an admin."); return; }
+
+  await ctx.reply("🧹 <b>Running session cleanup...</b>", { parse_mode: "HTML" });
+
+  try {
+    const activeIds = getActiveSessionUserIds();
+    const result = await cleanupStaleSessions(activeIds, 7);
+
+    if (result.deletedSessions === 0) {
+      await ctx.reply("✅ <b>Cleanup Done!</b>\n\nNo stale sessions found. MongoDB is clean.", { parse_mode: "HTML" });
+    } else {
+      await ctx.reply(
+        `✅ <b>Cleanup Done!</b>\n\n` +
+        `🗑 Sessions deleted: <b>${result.deletedSessions}</b>\n` +
+        `⚪ Unpaired deleted: <b>${result.deletedUnpaired}</b>\n` +
+        `🔑 Keys freed: <b>${result.deletedKeys}</b>\n\n` +
+        `✨ MongoDB cleaned up!`,
+        { parse_mode: "HTML" }
+      );
+    }
+  } catch (err: any) {
+    await ctx.reply(`❌ Error: ${esc(err?.message || "Unknown error")}`, { parse_mode: "HTML" });
+  }
+});
+
+bot.command("memory", async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) { await ctx.reply("🚫 You are not an admin."); return; }
+
+  const mem = process.memoryUsage();
+  const toMB = (b: number) => (b / 1024 / 1024).toFixed(1);
+
+  const heapUsed = parseFloat(toMB(mem.heapUsed));
+  const heapTotal = parseFloat(toMB(mem.heapTotal));
+  const rss = parseFloat(toMB(mem.rss));
+  const heapPct = Math.round((heapUsed / heapTotal) * 100);
+
+  const heapBar = buildMemBar(heapPct);
+  const heapStatus = heapPct >= 85 ? "🔴 Critical" : heapPct >= 65 ? "🟡 High" : "🟢 Normal";
+
+  const activeIds = getActiveSessionUserIds();
+
+  const text =
+    `🧠 <b>Server Memory Usage</b>\n\n` +
+    `📦 <b>RAM (RSS):</b> ${rss} MB\n` +
+    `🔵 <b>Heap Used:</b> ${heapUsed} MB / ${heapTotal} MB\n` +
+    `📊 <b>Heap %:</b> ${heapBar} ${heapPct}%\n` +
+    `🔋 <b>Status:</b> ${heapStatus}\n\n` +
+    `📱 <b>Active WA Sessions:</b> ${activeIds.size}\n` +
+    `💡 Limit: 400 MB (--max-old-space-size)`;
+
+  await ctx.reply(text, { parse_mode: "HTML" });
+});
+
+function buildMemBar(pct: number): string {
+  const filled = Math.round(pct / 10);
+  const empty = 10 - filled;
+  return `[${"█".repeat(filled)}${"░".repeat(empty)}]`;
+}
 
 bot.callbackQuery("broadcast_cancel", async (ctx) => {
   await ctx.answerCallbackQuery("Broadcast cancelled.");
