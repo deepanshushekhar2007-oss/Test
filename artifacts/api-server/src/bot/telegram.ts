@@ -6613,7 +6613,6 @@ export function startBot() {
   });
 
   let retryCount = 0;
-  const MAX_RETRIES = 5;
 
   async function launchBot() {
     try {
@@ -6630,24 +6629,25 @@ export function startBot() {
           retryCount = 0;
         },
       });
+      // bot.start() resolved (graceful stop) — restart polling
+      console.log("[BOT] Polling stopped gracefully, restarting in 5s...");
+      retryCount = 0;
+      setTimeout(() => launchBot(), 5000);
     } catch (err: any) {
-      if (err?.error_code === 409) {
-        retryCount++;
-        if (retryCount > MAX_RETRIES) {
-          console.error(`[BOT] 409 conflict — max retries (${MAX_RETRIES}) exceeded. Bot disabled.`);
-          return;
-        }
-        const delay = Math.min(retryCount * 15, 60);
-        console.log(`[BOT] 409 conflict — another instance running. Retry ${retryCount}/${MAX_RETRIES} in ${delay}s...`);
-        setTimeout(() => launchBot(), delay * 1000);
-        return;
-      }
       if (err?.error_code === 401) {
-        console.error("[BOT] Invalid TELEGRAM_BOT_TOKEN (401 Unauthorized). Bot disabled. Please set a valid token in environment variables.");
+        console.error("[BOT] Invalid TELEGRAM_BOT_TOKEN (401 Unauthorized). Bot disabled.");
         return;
       }
-      console.error("[BOT] Fatal error:", err?.message || err);
-      console.error("[BOT] Bot disabled due to error. Server will continue running.");
+      retryCount++;
+      const delay = err?.error_code === 409
+        ? Math.min(retryCount * 15, 120)   // 409: wait 15s, 30s ... max 2 min
+        : Math.min(retryCount * 5, 60);    // other errors: wait 5s, 10s ... max 1 min
+      if (err?.error_code === 409) {
+        console.log(`[BOT] 409 conflict — another instance running. Retry #${retryCount} in ${delay}s...`);
+      } else {
+        console.error(`[BOT] Error (retry #${retryCount} in ${delay}s): ${err?.message || err}`);
+      }
+      setTimeout(() => launchBot(), delay * 1000);
     }
   }
 
