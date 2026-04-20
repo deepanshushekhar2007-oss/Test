@@ -573,6 +573,22 @@ export async function applyGroupSettings(
   } catch (e: any) { console.error(`[WA][${userId}] approveJoin error:`, e?.message); }
 }
 
+export async function setGroupDisappearingMessages(
+  userId: string,
+  groupId: string,
+  duration: number
+): Promise<boolean> {
+  const session = sessions.get(userId);
+  if (!session?.socket || !session.connected) return false;
+  try {
+    await session.socket.groupToggleEphemeral(groupId, duration);
+    return true;
+  } catch (err: any) {
+    console.error(`[WA][${userId}] setGroupDisappearingMessages error:`, err?.message);
+    return false;
+  }
+}
+
 export async function setGroupIcon(
   userId: string,
   groupId: string,
