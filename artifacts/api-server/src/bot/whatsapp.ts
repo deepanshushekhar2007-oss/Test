@@ -101,7 +101,7 @@ async function createSocket(
     browser: Browsers.ubuntu("Chrome"),
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 20000,
+    keepAliveIntervalMs: 30000,
     generateHighQualityLinkPreview: false,
     syncFullHistory: false,
     markOnlineOnConnect: false,
