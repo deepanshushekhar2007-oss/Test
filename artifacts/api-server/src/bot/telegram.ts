@@ -558,6 +558,28 @@ const getLinkCancelRequests: Set<number> = new Set();
 const addMembersCancelRequests: Set<number> = new Set();
 const removeMembersCancelRequests: Set<number> = new Set();
 
+let autoChatGlobalEnabled: boolean = true;
+const autoChatAccessSet: Set<number> = new Set();
+
+function canUserSeeAutoChat(userId: number): boolean {
+  if (isAdmin(userId)) return true;
+  if (autoChatGlobalEnabled) return true;
+  return autoChatAccessSet.has(userId);
+}
+
+async function syncAutoChatSettings(): Promise<void> {
+  try {
+    const data = await loadBotData();
+    autoChatGlobalEnabled = data.autoChatEnabled ?? true;
+    autoChatAccessSet.clear();
+    for (const id of data.autoChatAccessList ?? []) {
+      autoChatAccessSet.add(id);
+    }
+  } catch (err: any) {
+    console.error("[AutoChat] syncAutoChatSettings error:", err?.message);
+  }
+}
+
 const MA_PAGE_SIZE = 20;
 const PL_PAGE_SIZE = 20;
 const AP_PAGE_SIZE = 20;
@@ -803,9 +825,11 @@ function mainMenu(userId?: number): InlineKeyboard {
     .text("🔍 CTC Checker", "ctc_checker").text("🔗 Get Link", "get_link").row()
     .text("🚪 Leave Group", "leave_group").text("🗑️ Remove Members", "remove_members").row()
     .text("👑 Make Admin", "make_admin").text("✅ Approval", "approval").row()
-    .text("📋 Get Pending List", "pending_list").text("➕ Add Members", "add_members").row()
-    .text("🤖 Auto Chat", "auto_chat_menu").row()
-    .text("🔌 Disconnect", "disconnect_wa");
+    .text("📋 Get Pending List", "pending_list").text("➕ Add Members", "add_members").row();
+  if (userId !== undefined && canUserSeeAutoChat(userId)) {
+    kb.text("🤖 Auto Chat", "auto_chat_menu").row();
+  }
+  kb.text("🔌 Disconnect", "disconnect_wa");
   return kb;
 }
 
@@ -931,13 +955,15 @@ bot.command("help", async (ctx) => {
     `• Invite/Cancel errors automatic skip hote hain\n` +
     `• Beech mein cancel kar sakte ho\n\n` +
 
+    (canUserSeeAutoChat(userId) ?
     `🤖 12. Auto Chat\n` +
     `• Auto Chat ke liye 2nd WhatsApp connect karo\n` +
     `• Chat Friend: funny/study messages auto send hote rahenge jab tak Stop na dabao\n` +
     `• Chat In Group: selected common groups mein funny/study messages rotate hote rahenge\n` +
     `• Messages fast-fast nahi jaate; random delay rotation use hota hai\n` +
     `• Delay rotation: 10 sec, 1 min, 10 min, 20 min, 30 min, 1 hour, 2 hours\n` +
-    `• Live status, sent/failed count, refresh aur stop controls milte hain\n\n` +
+    `• Live status, sent/failed count, refresh aur stop controls milte hain\n\n`
+    : "") +
 
     `━━━━━━━━━━━━━━━━━━\n\n` +
     `💬 Commands:\n` +
@@ -1235,10 +1261,58 @@ bot.command("admin", async (ctx) => {
     "📊 <code>/status</code> — View bot statistics\n" +
     "📱 <code>/sessions</code> — WhatsApp sessions list\n" +
     "🧠 <code>/memory</code> — Server RAM usage\n" +
-    "🧹 <code>/cleansessions [num]</code> — Delete session by number",
+    "🧹 <code>/cleansessions [num]</code> — Delete session by number\n\n" +
+    "🤖 <b>Auto Chat Controls:</b>\n" +
+    "🟢 <code>/autochat on</code> — Auto Chat sabhi users ke liye ON\n" +
+    "🔴 <code>/autochat off</code> — Auto Chat sabhi users ke liye OFF\n" +
+    "✅ <code>/accessautochat [id]</code> — Specific user ke liye Auto Chat ON\n" +
+    "❌ <code>/revokeautochat [id]</code> — Specific user ka Auto Chat OFF",
 
     { parse_mode: "HTML" }
   );
+});
+
+bot.command("autochat", async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) { await ctx.reply("🚫 You are not an admin."); return; }
+  const arg = (ctx.message?.text || "").split(/\s+/)[1]?.toLowerCase();
+  if (arg !== "on" && arg !== "off") {
+    await ctx.reply("❓ Usage:\n<code>/autochat on</code> — Sabhi users ke liye ON\n<code>/autochat off</code> — Sabhi users ke liye OFF", { parse_mode: "HTML" });
+    return;
+  }
+  const data = await loadBotData();
+  data.autoChatEnabled = arg === "on";
+  await saveBotData(data);
+  autoChatGlobalEnabled = data.autoChatEnabled;
+  await ctx.reply(
+    arg === "on"
+      ? "✅ <b>Auto Chat: ON</b>\n\n🤖 Sabhi users ko Auto Chat button dikhega." 
+      : "🔴 <b>Auto Chat: OFF</b>\n\n🚫 Kisi bhi user ko Auto Chat button nahi dikhega.\n💡 Specific user ke liye: <code>/accessautochat [user_id]</code>",
+    { parse_mode: "HTML" }
+  );
+});
+
+bot.command("accessautochat", async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) { await ctx.reply("🚫 You are not an admin."); return; }
+  const id = parseInt((ctx.message?.text || "").split(/\s+/)[1]);
+  if (isNaN(id)) { await ctx.reply("❓ Usage: <code>/accessautochat [user_id]</code>", { parse_mode: "HTML" }); return; }
+  const data = await loadBotData();
+  if (!data.autoChatAccessList.includes(id)) {
+    data.autoChatAccessList.push(id);
+    await saveBotData(data);
+    autoChatAccessSet.add(id);
+  }
+  await ctx.reply(`✅ <b>Auto Chat Access Granted!</b>\n\n👤 User: <code>${id}</code>\n🤖 Is user ko ab Auto Chat button dikhega (chahe global OFF ho).`, { parse_mode: "HTML" });
+});
+
+bot.command("revokeautochat", async (ctx) => {
+  if (!isAdmin(ctx.from!.id)) { await ctx.reply("🚫 You are not an admin."); return; }
+  const id = parseInt((ctx.message?.text || "").split(/\s+/)[1]);
+  if (isNaN(id)) { await ctx.reply("❓ Usage: <code>/revokeautochat [user_id]</code>", { parse_mode: "HTML" }); return; }
+  const data = await loadBotData();
+  data.autoChatAccessList = data.autoChatAccessList.filter((u) => u !== id);
+  await saveBotData(data);
+  autoChatAccessSet.delete(id);
+  await ctx.reply(`❌ <b>Auto Chat Access Revoked!</b>\n\n👤 User: <code>${id}</code>\n🚫 Is user ko ab Auto Chat button nahi dikhega.`, { parse_mode: "HTML" });
 });
 
 bot.command("access", async (ctx) => {
@@ -1345,12 +1419,21 @@ bot.command("status", async (ctx) => {
     accessText += rem > 0 ? `  ✅ <code>${uid}</code> — ${dLeft} days\n` : `  ⚠️ <code>${uid}</code> — EXPIRED\n`;
   }
   const bannedText = data.bannedUsers.length ? data.bannedUsers.map((id) => `  🚫 <code>${id}</code>`).join("\n") + "\n" : "  None\n";
+
+  const autoChatEnabled = data.autoChatEnabled ?? true;
+  const autoChatAccessList = data.autoChatAccessList ?? [];
+  let autoChatAccessText = autoChatAccessList.length
+    ? autoChatAccessList.map((id) => `  🤖 <code>${id}</code>`).join("\n") + "\n"
+    : "  None\n";
+
   await ctx.reply(
     "📊 <b>Bot Status</b>\n\n" +
     `🔒 <b>Subscription Mode:</b> ${data.subscriptionMode ? "ON 🟢" : "OFF 🔴"}\n` +
+    `🤖 <b>Auto Chat:</b> ${autoChatEnabled ? "ON 🟢 (Sabhi users ke liye)" : "OFF 🔴 (Sirf selected users ke liye)"}\n` +
     `👑 <b>Owner:</b> ${OWNER_USERNAME}\n` +
     `👥 <b>Total Users:</b> ${data.totalUsers.length}\n\n` +
     `✅ <b>Access List (${Object.keys(data.accessList).length}):</b>\n${accessText || "  None\n"}\n` +
+    `🤖 <b>Auto Chat Access (${autoChatAccessList.length}):</b>\n${autoChatAccessText}\n` +
     `🚫 <b>Banned (${data.bannedUsers.length}):</b>\n${bannedText}`,
     { parse_mode: "HTML" }
   );
@@ -3695,6 +3778,14 @@ bot.callbackQuery("auto_chat_menu", async (ctx) => {
   const userId = ctx.from.id;
   if (!(await checkAccessMiddleware(ctx))) return;
 
+  if (!canUserSeeAutoChat(userId)) {
+    await ctx.editMessageText(
+      "🚫 <b>Auto Chat Access Nahi Hai</b>\n\nYe feature abhi aapke liye available nahi hai.\nAdmin se contact karo.",
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+    );
+    return;
+  }
+
   if (!isConnected(String(userId))) {
     await ctx.editMessageText(
       "🤖 <b>Auto Chat</b>\n\n" +
@@ -5833,6 +5924,10 @@ export function startBot() {
     console.log("[BOT] TELEGRAM_BOT_TOKEN not set — bot disabled. Set it to enable the Telegram bot.");
     return;
   }
+
+  void syncAutoChatSettings().then(() => {
+    console.log(`[BOT] Auto Chat settings loaded: global=${autoChatGlobalEnabled} accessList=${autoChatAccessSet.size} users`);
+  });
 
   bot.catch((err) => {
     const e = err.error as any;
