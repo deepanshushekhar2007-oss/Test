@@ -618,6 +618,35 @@ interface QrPairingState {
 
 const qrPairings: Map<number, QrPairingState> = new Map();
 
+setInterval(() => {
+  const activeUserIds = new Set([
+    ...autoChatSessions.keys(),
+    ...cigSessions.keys(),
+    ...acfSessions.keys(),
+  ]);
+  for (const [userId] of userStates) {
+    if (!activeUserIds.has(userId)) {
+      userStates.delete(userId);
+    }
+  }
+  for (const [userId, state] of qrPairings) {
+    if (state.expired) {
+      if (state.interval) clearInterval(state.interval);
+      qrPairings.delete(userId);
+    }
+  }
+  joinCancelRequests.clear();
+  getLinkCancelRequests.clear();
+  addMembersCancelRequests.clear();
+  removeMembersCancelRequests.clear();
+  if (typeof (global as any).gc === "function") {
+    (global as any).gc();
+  }
+  console.log(
+    `[MEMORY] Cleanup: userStates=${userStates.size} autoChat=${autoChatSessions.size} cig=${cigSessions.size} acf=${acfSessions.size} qr=${qrPairings.size}`
+  );
+}, 20 * 60 * 1000);
+
 function qrActiveKeyboard(): InlineKeyboard {
   return new InlineKeyboard().text("❌ Cancel", "connect_pair_qr_cancel").text("🔙 Back", "connect_wa");
 }
