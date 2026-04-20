@@ -905,16 +905,19 @@ bot.command("help", async (ctx) => {
 
     `📱 1. Connect WhatsApp\n` +
     `• Bot se apna WhatsApp link karo\n` +
-    `• Phone number do → 8-digit pairing code milega\n` +
-    `• WhatsApp → Linked Devices mein code daalo\n` +
+    `• Phone number do → Pairing code milega (koi bhi format chalega, jaise +91 9999-999999)\n` +
+    `• WhatsApp → Linked Devices → Link with phone number → code daalo\n` +
     `• Ek baar connect hone ke baad sab features use karo\n\n` +
 
     `🏗️ 2. Create Groups\n` +
     `• Ek saath kaafi saare WhatsApp groups banao\n` +
     `• Custom ya auto-numbered names (e.g. Group 1, Group 2...)\n` +
-    `• Group description aur DP (icon) set kar sakte ho\n` +
-    `• Permissions: kaun message, kaun add kar sakta hai\n` +
-    `• Approval mode ON/OFF kar sakte ho\n` +
+    `• Group description set kar sakte ho\n` +
+    `• Group DP (icon/photo) set karo ya skip karo\n` +
+    `• Permissions: kaun message, kaun add kar sakta hai, approval mode\n` +
+    `• ⏳ Disappearing Messages: 24 Hours / 7 Days / 90 Days / Off\n` +
+    `• 👫 Friends Add: Group bante waqt seedha friends ko add karo\n` +
+    `  (koi bhi number format — +919999999999, +91 9999-999999, 919999999999)\n` +
     `• Live progress dikhta hai jaise groups bante hain\n\n` +
 
     `🔗 3. Get Group Links\n` +
@@ -962,22 +965,36 @@ bot.command("help", async (ctx) => {
     `• Pata chal jata hai kaun se group mein kitne log pending\n\n` +
 
     `➕ 11. Add Members\n` +
-    `• Group link do → Friend numbers do → Admin/Navy/Member VCF do\n` +
-    `• Total kitna add karna hai batao\n` +
+    `• Single group: Link do → Friend numbers + Admin/Navy/Member VCF do\n` +
+    `• Multiple groups: Ek se zyada links ek per line do → sirf Friend numbers bhejo\n` +
+    `  → Sabhi groups mein ek saath add ho jayenge\n` +
     `• Add 1 by 1 (safe, with delay) ya Add Together (fast, ek baar mein)\n` +
-    `• Live progress dikhta hai\n` +
-    `• Invite/Cancel errors automatic skip hote hain\n` +
-    `• Beech mein cancel kar sakte ho\n\n` +
+    `• Live progress dikhta hai, beech mein cancel kar sakte ho\n` +
+    `• Invite/Cancel errors automatic skip hote hain\n\n` +
+
+    `⚙️ 12. Edit Settings\n` +
+    `• Admin groups scan hote hain → Similar Groups ya All Groups choose karo\n` +
+    `• Multiple groups ek saath select karo (pagination + Select All)\n` +
+    `• Permissions toggle karo (message, add members, approval mode)\n` +
+    `• ⏳ Disappearing Messages set karo: 24h / 7 Days / 90 Days / Off\n` +
+    `• Group DP change karo ya skip karo\n` +
+    `• Description update karo ya skip karo\n` +
+    `• Review karke Apply — har group ka live progress dikhega\n` +
+    `• Beech mein cancel bhi kar sakte ho\n\n` +
 
     (canUserSeeAutoChat(userId) ?
-    `🤖 12. Auto Chat\n` +
+    `🤖 13. Auto Chat  ⭐ Paid Service\n` +
     `• Auto Chat ke liye 2nd WhatsApp connect karo\n` +
     `• Chat Friend: funny/study messages auto send hote rahenge jab tak Stop na dabao\n` +
     `• Chat In Group: selected common groups mein funny/study messages rotate hote rahenge\n` +
     `• Messages fast-fast nahi jaate; random delay rotation use hota hai\n` +
     `• Delay rotation: 10 sec, 1 min, 10 min, 20 min, 30 min, 1 hour, 2 hours\n` +
     `• Live status, sent/failed count, refresh aur stop controls milte hain\n\n`
-    : "") +
+    :
+    `🤖 13. Auto Chat  ⭐ Paid Service\n` +
+    `• Automatically send messages to friends or groups on WhatsApp\n` +
+    `• Random delay rotation keeps it natural and safe\n` +
+    `• To buy Auto Chat access, message ${OWNER_USERNAME} on Telegram\n\n`) +
 
     `━━━━━━━━━━━━━━━━━━\n\n` +
     `💬 Commands:\n` +
@@ -988,7 +1005,9 @@ bot.command("help", async (ctx) => {
     `⚠️ Important Notes:\n` +
     `• CTC Pending ke liye aap group admin hone chahiye\n` +
     `• Group mein "Approval required" mode ON hona chahiye\n` +
-    `• 1 by 1 Approval ke liye bhi admin hona zaroori hai`;
+    `• 1 by 1 Approval ke liye bhi admin hona zaroori hai\n` +
+    `• Connect WhatsApp mein number kisi bhi format mein de sakte ho\n` +
+    `  (+91 9999-999999, +919999999999 — sab chalega)`;
 
   const helpText =
     `👤 <b>Owner:</b> ${OWNER_USERNAME}\n\n` +
