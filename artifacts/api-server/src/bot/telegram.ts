@@ -2003,7 +2003,7 @@ bot.callbackQuery("group_cancel_dismiss", async (ctx) => {
 
 async function createGroupsBackground(userId: string, numericUserId: number, gs: GroupSettings, chatId: number, msgId: number) {
   const perms: GroupPermissions = { editGroupInfo: gs.editGroupInfo, sendMessages: gs.sendMessages, addMembers: gs.addMembers, approveJoin: gs.approveJoin };
-  const results: Array<{ name: string; link: string | null; error?: string }> = [];
+  const results: Array<{ name: string; link: string | null; error?: string; friendsAdded?: number; friendsFailed?: boolean }> = [];
   const total = gs.finalNames.length;
 
   for (let i = 0; i < total; i++) {
@@ -2018,7 +2018,8 @@ async function createGroupsBackground(userId: string, numericUserId: number, gs:
 
     const groupName = gs.finalNames[i];
     try {
-      const result = await createWhatsAppGroup(userId, groupName);
+      // Pass friendNumbers at creation time — bypasses WhatsApp privacy restrictions on non-contacts
+      const result = await createWhatsAppGroup(userId, groupName, gs.friendNumbers);
       if (result) {
         await new Promise((r) => setTimeout(r, 1500));
         await applyGroupSettings(userId, result.id, perms, gs.description);
@@ -2027,11 +2028,19 @@ async function createGroupsBackground(userId: string, numericUserId: number, gs:
           await setGroupDisappearingMessages(userId, result.id, gs.disappearingMessages);
         }
         if (gs.dpBuffer) { await new Promise((r) => setTimeout(r, 2000)); await setGroupIcon(userId, result.id, gs.dpBuffer); }
-        if (gs.friendNumbers.length > 0) {
+        // If friends were not added during creation (participantsFailed), try adding them separately with bulk
+        if (gs.friendNumbers.length > 0 && result.participantsFailed) {
           await new Promise((r) => setTimeout(r, 3000));
-          await addGroupParticipantsBulk(userId, result.id, gs.friendNumbers);
+          const addResults = await addGroupParticipantsBulk(userId, result.id, gs.friendNumbers);
+          const addedCount = addResults.filter(r => r.success).length;
+          results.push({ name: groupName, link: result.inviteCode, friendsAdded: addedCount, friendsFailed: addedCount < gs.friendNumbers.length });
+        } else {
+          results.push({
+            name: groupName,
+            link: result.inviteCode,
+            friendsAdded: gs.friendNumbers.length > 0 ? (result.addedParticipants ?? 0) : undefined,
+          });
         }
-        results.push({ name: groupName, link: result.inviteCode });
       } else {
         results.push({ name: groupName, link: null, error: "Failed to create" });
       }
@@ -2061,8 +2070,18 @@ async function createGroupsBackground(userId: string, numericUserId: number, gs:
   for (const r of results) {
     if (r.error === "Cancelled by user") {
       message += `🛑 <b>${esc(r.name)}</b>\n⚠️ Cancelled\n\n`;
+    } else if (r.link) {
+      let line = `✅ <b>${esc(r.name)}</b>\n🔗 ${r.link}`;
+      if (r.friendsAdded !== undefined) {
+        if (r.friendsFailed) {
+          line += `\n👫 Friends: ${r.friendsAdded} added (kuch add nahi hue — WhatsApp ne reject kiya)`;
+        } else if (r.friendsAdded > 0) {
+          line += `\n👫 Friends: ${r.friendsAdded} added ✅`;
+        }
+      }
+      message += line + "\n\n";
     } else {
-      message += r.link ? `✅ <b>${esc(r.name)}</b>\n🔗 ${r.link}\n\n` : `❌ <b>${esc(r.name)}</b>\n⚠️ ${esc(r.error || "")}\n\n`;
+      message += `❌ <b>${esc(r.name)}</b>\n⚠️ ${esc(r.error || "")}\n\n`;
     }
   }
 
