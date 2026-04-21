@@ -319,10 +319,53 @@ async function createSocket(
         return;
       }
 
-      // All other close reasons — reconnect after delay
-      console.log(`[WA][${userId}] Will reconnect in 5s gen=${myGenId}...`);
+      // 403 = WhatsApp permanently rejected this session (banned, session invalidated, or device unlinked remotely)
+      // Retrying endlessly on 403 causes memory leaks (500+ sockets accumulate). Cap retries tightly.
+      if (statusCode === 403) {
+        session.retryCount++;
+        const MAX_403_RETRIES = session.wasConnected ? 10 : 3;
+        if (session.retryCount > MAX_403_RETRIES) {
+          console.log(`[WA][${userId}] 403 repeated ${session.retryCount}x — WhatsApp permanently rejected. Stopping reconnect.`);
+          closeSocketSafe(sock);
+          session.socket = null;
+          sessions.delete(userId);
+          clearSessionData(userId);
+          onDisconnected("WhatsApp ne connection reject kar diya (403). Dobara connect karein.");
+          return;
+        }
+        // Exponential backoff for 403: 10s, 20s, 40s... up to 2 min
+        const delay = Math.min(10000 * Math.pow(2, session.retryCount - 1), 120000);
+        console.log(`[WA][${userId}] 403 retry ${session.retryCount}/${MAX_403_RETRIES} in ${delay / 1000}s gen=${myGenId}...`);
+        session.codeRequested = false;
+        setTimeout(async () => {
+          if (session.socketGenId !== myGenId) return;
+          const currentSession = sessions.get(userId);
+          if (!currentSession || currentSession !== session) return;
+          try {
+            await createSocket(userId, phoneNumber, pairingMode, onCode, onQr, onConnected, onDisconnected, session);
+          } catch (e: any) {
+            sessions.delete(userId);
+            onDisconnected(`Reconnect failed: ${e?.message}`);
+          }
+        }, delay);
+        return;
+      }
+
+      // All other close reasons — reconnect after delay with a safety cap
+      const MAX_RETRIES = 50;
       session.codeRequested = false;
       session.retryCount++;
+      if (session.retryCount > MAX_RETRIES) {
+        console.log(`[WA][${userId}] Too many retries (${session.retryCount}) — stopping reconnect to prevent memory leak.`);
+        closeSocketSafe(sock);
+        session.socket = null;
+        sessions.delete(userId);
+        onDisconnected("Connection baar baar fail ho raha hai. Dobara connect karein.");
+        return;
+      }
+      // Exponential backoff: 5s → 10s → 20s → max 2 min
+      const reconnectDelay = Math.min(5000 * Math.pow(1.5, Math.floor(session.retryCount / 5)), 120000);
+      console.log(`[WA][${userId}] Will reconnect in ${reconnectDelay / 1000}s gen=${myGenId}...`);
       setTimeout(async () => {
         if (session.socketGenId !== myGenId) return;
         const currentSession = sessions.get(userId);
@@ -333,7 +376,7 @@ async function createSocket(
           sessions.delete(userId);
           onDisconnected(`Reconnect failed: ${e?.message}`);
         }
-      }, 5000);
+      }, reconnectDelay);
     }
   });
 }
