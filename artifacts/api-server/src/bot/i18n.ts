@@ -90,31 +90,35 @@ function cachePut(key: string, value: string) {
   translateCache.set(key, value);
 }
 
-function googleTranslate(text: string, target: string): Promise<string> {
+// POST-based translation — supports much longer text than GET (no URL limit).
+function googleTranslateOnce(text: string, target: string): Promise<string> {
   return new Promise((resolve) => {
     const params = new URLSearchParams({
       client: "gtx",
       sl: "auto",
       tl: target,
       dt: "t",
-      q: text,
     });
     const url = `https://translate.googleapis.com/translate_a/single?${params.toString()}`;
-    const req = https.get(
+    const body = new URLSearchParams({ q: text }).toString();
+    const req = https.request(
       url,
       {
+        method: "POST",
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
           Accept: "*/*",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": Buffer.byteLength(body).toString(),
         },
       },
       (res) => {
-        let body = "";
-        res.on("data", (c) => (body += c));
+        let buf = "";
+        res.on("data", (c) => (buf += c));
         res.on("end", () => {
           try {
-            const data = JSON.parse(body);
+            const data = JSON.parse(buf);
             const segments: string[] = [];
             if (Array.isArray(data) && Array.isArray(data[0])) {
               for (const seg of data[0]) {
@@ -131,13 +135,54 @@ function googleTranslate(text: string, target: string): Promise<string> {
       }
     );
     req.on("error", () => resolve(text));
-    req.setTimeout(8000, () => {
+    req.setTimeout(15000, () => {
       try {
         req.destroy();
       } catch {}
       resolve(text);
     });
+    req.write(body);
+    req.end();
   });
+}
+
+// Splits very long text into chunks ≤ MAX_CHUNK by line boundaries so each
+// piece fits comfortably in one Google Translate request, then translates
+// chunks in parallel and rejoins. Keeps separator characters intact.
+const MAX_CHUNK = 1800;
+
+function splitForTranslation(text: string): string[] {
+  if (text.length <= MAX_CHUNK) return [text];
+  const lines = text.split("\n");
+  const chunks: string[] = [];
+  let cur = "";
+  for (const line of lines) {
+    // If a single line is huge, hard-split it.
+    if (line.length > MAX_CHUNK) {
+      if (cur) { chunks.push(cur); cur = ""; }
+      for (let i = 0; i < line.length; i += MAX_CHUNK) {
+        chunks.push(line.slice(i, i + MAX_CHUNK));
+      }
+      continue;
+    }
+    if (cur.length + line.length + 1 > MAX_CHUNK) {
+      chunks.push(cur);
+      cur = line;
+    } else {
+      cur = cur ? cur + "\n" + line : line;
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+
+async function googleTranslate(text: string, target: string): Promise<string> {
+  const chunks = splitForTranslation(text);
+  if (chunks.length === 1) return googleTranslateOnce(text, target);
+  const translated = await Promise.all(
+    chunks.map((c) => googleTranslateOnce(c, target))
+  );
+  return translated.join("\n");
 }
 
 // HTML-aware translator: preserves all HTML tags (including <pre>/<code>) but
