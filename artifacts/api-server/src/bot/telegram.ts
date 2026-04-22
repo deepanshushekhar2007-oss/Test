@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard, InputFile, webhookCallback } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import {
   connectWhatsApp,
   connectWhatsAppQr,
@@ -55,12 +55,6 @@ const OWNER_USERNAME = "@SPIDYWS";
 const BOT_DISPLAY_NAME = "ᴡꜱ ᴀᴜᴛᴏᴍᴀᴛɪᴏɴ";
 
 const bot = new Bot(token || "placeholder");
-
-const WEBHOOK_SECRET = process.env["TELEGRAM_WEBHOOK_SECRET"] || "tg-secret-change-me";
-
-export const telegramWebhookHandler = webhookCallback(bot, "express", {
-  secretToken: WEBHOOK_SECRET,
-});
 
 type TelegramButtonStyle = "primary" | "success" | "danger";
 
@@ -6685,7 +6679,7 @@ function splitMessage(msg: string, maxLen: number): string[] {
   return parts;
 }
 
-export async function startBot() {
+export function startBot() {
   if (!token) {
     console.log("[BOT] TELEGRAM_BOT_TOKEN not set — bot disabled. Set it to enable the Telegram bot.");
     return;
@@ -6703,47 +6697,58 @@ export async function startBot() {
     console.error(`[BOT] Error in update ${err.ctx?.update?.update_id}: ${desc || err.message}`);
   });
 
-  try {
-    await bot.init();
-    console.log(`[BOT] Bot initialized: @${bot.botInfo.username}`);
-  } catch (err: any) {
-    if (err?.error_code === 401) {
-      console.error("[BOT] Invalid TELEGRAM_BOT_TOKEN (401 Unauthorized). Bot disabled.");
-      return;
+  let retryCount = 0;
+
+  async function launchBot() {
+    try {
+      await bot.api.deleteWebhook({ drop_pending_updates: true });
+      console.log("[BOT] Webhook cleared, starting polling...");
+    } catch (err: any) {
+      console.error("[BOT] Failed to delete webhook:", err?.message);
     }
-    console.error("[BOT] bot.init() failed:", err?.message || err);
-    return;
+
+    try {
+      await bot.start({
+        onStart: () => {
+          console.log("Telegram bot started successfully!");
+          retryCount = 0;
+        },
+      });
+      // bot.start() resolved (graceful stop) — restart polling
+      console.log("[BOT] Polling stopped gracefully, restarting in 5s...");
+      retryCount = 0;
+      setTimeout(() => launchBot(), 5000);
+    } catch (err: any) {
+      if (err?.error_code === 401) {
+        console.error("[BOT] Invalid TELEGRAM_BOT_TOKEN (401 Unauthorized). Bot disabled.");
+        return;
+      }
+      retryCount++;
+      const delay = err?.error_code === 409
+        ? Math.min(retryCount * 15, 120)   // 409: wait 15s, 30s ... max 2 min
+        : Math.min(retryCount * 5, 60);    // other errors: wait 5s, 10s ... max 1 min
+      if (err?.error_code === 409) {
+        console.log(`[BOT] 409 conflict — another instance running. Retry #${retryCount} in ${delay}s...`);
+      } else {
+        console.error(`[BOT] Error (retry #${retryCount} in ${delay}s): ${err?.message || err}`);
+      }
+      setTimeout(() => launchBot(), delay * 1000);
+    }
   }
 
-  const renderUrl =
-    process.env["RENDER_EXTERNAL_URL"] || process.env["WEBHOOK_URL"];
+  process.on("SIGTERM", async () => {
+    console.log("[BOT] SIGTERM received, stopping bot...");
+    try { await bot.stop(); } catch {}
+    process.exit(0);
+  });
 
-  if (!renderUrl) {
-    console.error(
-      "[BOT] RENDER_EXTERNAL_URL/WEBHOOK_URL not set — cannot register webhook. Set WEBHOOK_URL env var to your public https URL.",
-    );
-    return;
-  }
+  process.on("SIGINT", async () => {
+    console.log("[BOT] SIGINT received, stopping bot...");
+    try { await bot.stop(); } catch {}
+    process.exit(0);
+  });
 
-  const webhookUrl = `${renderUrl.replace(/\/$/, "")}/api/telegram/webhook`;
-
-  try {
-    await bot.api.setWebhook(webhookUrl, {
-      secret_token: WEBHOOK_SECRET,
-      drop_pending_updates: true,
-      allowed_updates: [
-        "message",
-        "edited_message",
-        "callback_query",
-        "chat_member",
-        "my_chat_member",
-        "chat_join_request",
-      ],
-    });
-    console.log(`[BOT] Webhook registered: ${webhookUrl}`);
-  } catch (err: any) {
-    console.error("[BOT] setWebhook failed:", err?.message || err);
-  }
+  launchBot();
 }
 
 export { bot };

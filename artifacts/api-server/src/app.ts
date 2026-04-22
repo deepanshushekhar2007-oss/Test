@@ -3,7 +3,6 @@ import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
-import { telegramWebhookHandler } from "./bot/telegram";
 
 const app: Express = express();
 
@@ -29,9 +28,6 @@ app.use(
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Telegram webhook — must be mounted before "/api" router
-app.post("/api/telegram/webhook", telegramWebhookHandler);
 
 app.use("/api", router);
 
