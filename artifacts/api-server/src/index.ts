@@ -59,10 +59,10 @@ async function main() {
     logger.info({ port }, "Server listening");
 
     // Render free tier sleep na kare isliye ping
-    const renderUrl = process.env["RENDER_EXTERNAL_URL"];
+    const renderUrl = process.env["RENDER_EXTERNAL_URL"] || process.env["WEBHOOK_URL"];
     if (renderUrl) {
-      const pingUrl = `${renderUrl}/api/healthz`;
-      console.log(`[KEEP-ALIVE] Will ping ${pingUrl} every 10 minutes`);
+      const pingUrl = `${renderUrl.replace(/\/$/, "")}/api/healthz`;
+      console.log(`[KEEP-ALIVE] Will ping ${pingUrl} every 5 minutes`);
       setInterval(() => {
         const client = pingUrl.startsWith("https") ? https : http;
         client.get(pingUrl, (res) => {
@@ -70,7 +70,7 @@ async function main() {
         }).on("error", (err) => {
           console.error(`[KEEP-ALIVE] Ping failed: ${err.message}`);
         });
-      }, 10 * 60 * 1000);
+      }, 5 * 60 * 1000);
     }
 
     // Har 24 ghante mein auto cleanup chalao

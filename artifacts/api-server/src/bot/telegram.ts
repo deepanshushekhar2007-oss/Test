@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard, InputFile } from "grammy";
+import { Bot, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import {
   connectWhatsApp,
   connectWhatsAppQr,
@@ -6679,7 +6679,18 @@ function splitMessage(msg: string, maxLen: number): string[] {
   return parts;
 }
 
-export function startBot() {
+const WEBHOOK_PATH = "/api/telegram-webhook";
+const WEBHOOK_SECRET = process.env["TELEGRAM_WEBHOOK_SECRET"] || "";
+
+export const telegramWebhookPath = WEBHOOK_PATH;
+export const telegramWebhookHandler = token
+  ? webhookCallback(bot, "express", {
+      secretToken: WEBHOOK_SECRET || undefined,
+      timeoutMilliseconds: 60_000,
+    })
+  : (_req: any, res: any) => res.status(503).send("Bot disabled");
+
+export async function startBot() {
   if (!token) {
     console.log("[BOT] TELEGRAM_BOT_TOKEN not set — bot disabled. Set it to enable the Telegram bot.");
     return;
@@ -6696,6 +6707,32 @@ export function startBot() {
     if (code === 400 && desc.includes("message is not modified")) return;
     console.error(`[BOT] Error in update ${err.ctx?.update?.update_id}: ${desc || err.message}`);
   });
+
+  await bot.init().catch((err: any) => {
+    console.error("[BOT] init failed:", err?.message || err);
+  });
+
+  const publicUrl =
+    process.env["WEBHOOK_URL"] ||
+    process.env["RENDER_EXTERNAL_URL"] ||
+    "";
+
+  if (publicUrl) {
+    const webhookUrl = `${publicUrl.replace(/\/$/, "")}${WEBHOOK_PATH}`;
+    try {
+      await bot.api.setWebhook(webhookUrl, {
+        drop_pending_updates: true,
+        allowed_updates: ["message", "callback_query", "edited_message", "channel_post"],
+        ...(WEBHOOK_SECRET ? { secret_token: WEBHOOK_SECRET } : {}),
+      });
+      console.log(`[BOT] Webhook set to ${webhookUrl} — bot ready (webhook mode).`);
+    } catch (err: any) {
+      console.error("[BOT] Failed to set webhook:", err?.message || err);
+    }
+    return;
+  }
+
+  console.log("[BOT] No public URL (RENDER_EXTERNAL_URL / WEBHOOK_URL) — falling back to long polling (dev mode).");
 
   let retryCount = 0;
 
