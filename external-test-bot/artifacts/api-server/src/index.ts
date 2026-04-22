@@ -25,7 +25,7 @@ async function main() {
   console.log("[INIT] MongoDB connected successfully");
   await restoreWhatsAppSessions();
 
-  app.listen(port, (err) => {
+  app.listen(port, async (err) => {
     if (err) {
       logger.error({ err }, "Error listening on port");
       process.exit(1);
@@ -33,22 +33,25 @@ async function main() {
 
     logger.info({ port }, "Server listening");
 
+    // Register Telegram webhook AFTER server is listening so the URL is reachable.
+    await startBot();
+
+    // Keep-alive ping prevents Render free tier from spinning down due to inactivity.
     const renderUrl = process.env["RENDER_EXTERNAL_URL"];
     if (renderUrl) {
       const pingUrl = `${renderUrl}/api/healthz`;
-      console.log(`[KEEP-ALIVE] Will ping ${pingUrl} every 10 minutes`);
+      console.log(`[KEEP-ALIVE] Will ping ${pingUrl} every 5 minutes`);
       setInterval(() => {
         const client = pingUrl.startsWith("https") ? https : http;
         client.get(pingUrl, (res) => {
           console.log(`[KEEP-ALIVE] Ping status: ${res.statusCode}`);
+          res.resume();
         }).on("error", (err) => {
           console.error(`[KEEP-ALIVE] Ping failed: ${err.message}`);
         });
-      }, 10 * 60 * 1000);
+      }, 5 * 60 * 1000);
     }
   });
-
-  startBot();
 }
 
 process.on("SIGTERM", async () => {

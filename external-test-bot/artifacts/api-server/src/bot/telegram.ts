@@ -1,4 +1,4 @@
-import { Bot, InlineKeyboard, InputFile } from "grammy";
+import { Bot, InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import {
   connectWhatsApp,
   connectWhatsAppQr,
@@ -52,6 +52,18 @@ const OWNER_USERNAME = "@SPIDYWS";
 const BOT_DISPLAY_NAME = "ᴡꜱ ᴀᴜᴛᴏᴍᴀᴛɪᴏɴ";
 
 const bot = new Bot(token || "placeholder");
+
+// ─── Per-user last-activity tracker (used by the hourly cleanup job) ──────────
+// Updated automatically on EVERY incoming Telegram update via the middleware
+// below. We never have to touch the 5000+ existing call sites — any user who
+// interacts with the bot stays "fresh" for the cleanup window.
+const lastActivity: Map<number, number> = new Map();
+
+bot.use(async (ctx, next) => {
+  const uid = ctx.from?.id;
+  if (uid) lastActivity.set(uid, Date.now());
+  await next();
+});
 
 type TelegramButtonStyle = "primary" | "success" | "danger";
 
@@ -5111,7 +5123,90 @@ function splitMessage(msg: string, maxLen: number): string[] {
   return parts;
 }
 
-export function startBot() {
+// ─── Memory cleanup (TTL) ─────────────────────────────────────────────────────
+// Runs every hour. Removes entries from in-memory Maps/Sets for users who have
+// been idle for >2 hours, BUT skips anyone with active background work
+// (running auto-chat session, running CIG session, or active QR pairing) so
+// nothing in-progress breaks for active users.
+const IDLE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+function isUserBusy(userId: number): boolean {
+  const auto = autoChatSessions.get(userId);
+  if (auto && auto.running && !auto.cancelled) return true;
+  const cig = cigSessions.get(userId);
+  if (cig && cig.running && !cig.cancelled) return true;
+  const qr = qrPairings.get(userId);
+  if (qr && !qr.expired && qr.interval) return true;
+  return false;
+}
+
+function cleanupStaleEntries(): void {
+  const now = Date.now();
+  let removed = 0;
+
+  // Collect every user id that appears in any tracked structure.
+  const allUserIds = new Set<number>();
+  for (const id of userStates.keys()) allUserIds.add(id);
+  for (const id of qrPairings.keys()) allUserIds.add(id);
+  for (const id of autoChatSessions.keys()) allUserIds.add(id);
+  for (const id of cigSessions.keys()) allUserIds.add(id);
+  for (const id of joinCancelRequests) allUserIds.add(id);
+  for (const id of getLinkCancelRequests) allUserIds.add(id);
+  for (const id of addMembersCancelRequests) allUserIds.add(id);
+  for (const id of lastActivity.keys()) allUserIds.add(id);
+
+  for (const uid of allUserIds) {
+    if (isUserBusy(uid)) continue;
+
+    const last = lastActivity.get(uid) ?? 0;
+    if (now - last < IDLE_TTL_MS) continue;
+
+    // User idle for >TTL and has nothing running — safe to clear.
+    if (userStates.delete(uid)) removed++;
+
+    const qr = qrPairings.get(uid);
+    if (qr) {
+      if (qr.interval) clearInterval(qr.interval);
+      qrPairings.delete(uid);
+      removed++;
+    }
+
+    // Finished/cancelled sessions are safe to drop (busy ones were filtered out above).
+    if (autoChatSessions.delete(uid)) removed++;
+    if (cigSessions.delete(uid)) removed++;
+
+    if (joinCancelRequests.delete(uid)) removed++;
+    if (getLinkCancelRequests.delete(uid)) removed++;
+    if (addMembersCancelRequests.delete(uid)) removed++;
+
+    lastActivity.delete(uid);
+  }
+
+  if (removed > 0) {
+    console.log(
+      `[CLEANUP] Removed ${removed} stale entries. ` +
+      `Live: userStates=${userStates.size}, qr=${qrPairings.size}, ` +
+      `autoChat=${autoChatSessions.size}, cig=${cigSessions.size}, ` +
+      `lastActivity=${lastActivity.size}`,
+    );
+  }
+}
+
+let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+const WEBHOOK_PATH = "/api/telegram-webhook";
+const WEBHOOK_SECRET = process.env["TELEGRAM_WEBHOOK_SECRET"] || "";
+
+export const telegramWebhookPath = WEBHOOK_PATH;
+export const telegramWebhookHandler = token
+  ? webhookCallback(bot, "express", {
+      secretToken: WEBHOOK_SECRET || undefined,
+      timeoutMilliseconds: 60_000,
+    })
+  : (_req: any, res: any) => res.status(503).send("Bot disabled");
+
+export async function startBot() {
   if (!token) {
     console.log("[BOT] TELEGRAM_BOT_TOKEN not set — bot disabled. Set it to enable the Telegram bot.");
     return;
@@ -5125,10 +5220,42 @@ export function startBot() {
     console.error(`[BOT] Error in update ${err.ctx?.update?.update_id}: ${desc || err.message}`);
   });
 
+  await bot.init().catch((err: any) => {
+    console.error("[BOT] init failed:", err?.message || err);
+  });
+
+  // Start the hourly memory cleanup once.
+  if (!cleanupTimer) {
+    cleanupTimer = setInterval(cleanupStaleEntries, CLEANUP_INTERVAL_MS);
+    console.log(`[CLEANUP] Hourly stale-entry cleanup scheduled (idle TTL = ${IDLE_TTL_MS / 60000} min).`);
+  }
+
+  const publicUrl =
+    process.env["WEBHOOK_URL"] ||
+    process.env["RENDER_EXTERNAL_URL"] ||
+    "";
+
+  if (publicUrl) {
+    const webhookUrl = `${publicUrl.replace(/\/$/, "")}${WEBHOOK_PATH}`;
+    try {
+      await bot.api.setWebhook(webhookUrl, {
+        drop_pending_updates: true,
+        allowed_updates: ["message", "callback_query", "edited_message", "channel_post"],
+        ...(WEBHOOK_SECRET ? { secret_token: WEBHOOK_SECRET } : {}),
+      });
+      console.log(`[BOT] Webhook set to ${webhookUrl} — bot ready (webhook mode).`);
+    } catch (err: any) {
+      console.error("[BOT] Failed to set webhook:", err?.message || err);
+    }
+    return;
+  }
+
+  console.log("[BOT] No public URL (RENDER_EXTERNAL_URL / WEBHOOK_URL) — falling back to long polling (dev mode).");
+
   let retryCount = 0;
   const MAX_RETRIES = 5;
 
-  async function launchBot() {
+  async function launchPolling() {
     try {
       await bot.api.deleteWebhook({ drop_pending_updates: true });
       console.log("[BOT] Webhook cleared, starting polling...");
@@ -5152,31 +5279,28 @@ export function startBot() {
         }
         const delay = Math.min(retryCount * 15, 60);
         console.log(`[BOT] 409 conflict — another instance running. Retry ${retryCount}/${MAX_RETRIES} in ${delay}s...`);
-        setTimeout(() => launchBot(), delay * 1000);
+        setTimeout(() => launchPolling(), delay * 1000);
         return;
       }
       if (err?.error_code === 401) {
-        console.error("[BOT] Invalid TELEGRAM_BOT_TOKEN (401 Unauthorized). Bot disabled. Please set a valid token in environment variables.");
+        console.error("[BOT] Invalid TELEGRAM_BOT_TOKEN (401 Unauthorized). Bot disabled.");
         return;
       }
       console.error("[BOT] Fatal error:", err?.message || err);
-      console.error("[BOT] Bot disabled due to error. Server will continue running.");
     }
   }
 
   process.on("SIGTERM", async () => {
     console.log("[BOT] SIGTERM received, stopping bot...");
     try { await bot.stop(); } catch {}
-    process.exit(0);
   });
 
   process.on("SIGINT", async () => {
     console.log("[BOT] SIGINT received, stopping bot...");
     try { await bot.stop(); } catch {}
-    process.exit(0);
   });
 
-  launchBot();
+  launchPolling();
 }
 
 export { bot };
