@@ -76,6 +76,11 @@ type TelegramButtonStyle = "primary" | "success" | "danger";
 function getButtonStyle(text: string, callbackData?: string): TelegramButtonStyle {
   const value = `${text} ${callbackData || ""}`.toLowerCase();
 
+  // Default language button (English+Hindi) → green
+  if (value.includes("lang_set:default")) {
+    return "success";
+  }
+
   if (
     value.includes("cancel") ||
     value.includes("delete") ||

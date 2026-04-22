@@ -250,24 +250,82 @@ const REPLY_MARKUP_METHODS = new Set([
   "sendVoice",
 ]);
 
+// Batches all uncached button labels into a SINGLE Google Translate request
+// using a rare separator. Already-cached labels are reused. This turns N
+// sequential HTTP calls into at most 1 — a huge speed-up for big keyboards.
+const BATCH_SEP = "\n@@@SEP@@@\n";
+
+async function translateBatch(texts: string[], lang: string): Promise<string[]> {
+  if (texts.length === 0) return [];
+  const result = new Array<string>(texts.length);
+  const missingIdx: number[] = [];
+  const missingTxt: string[] = [];
+  for (let i = 0; i < texts.length; i++) {
+    const t = texts[i];
+    const key = `${lang}|btn|${t}`;
+    const cached = translateCache.get(key);
+    if (cached !== undefined) {
+      result[i] = cached;
+    } else if (!t || !t.trim()) {
+      result[i] = t;
+    } else {
+      missingIdx.push(i);
+      missingTxt.push(t);
+    }
+  }
+  if (missingTxt.length > 0) {
+    let translatedParts: string[];
+    try {
+      const joined = missingTxt.join(BATCH_SEP);
+      const out = await googleTranslate(joined, lang);
+      translatedParts = out.split(BATCH_SEP);
+      // Fallback: if separator got mangled and counts don't match, fall back
+      // to per-item translation in parallel.
+      if (translatedParts.length !== missingTxt.length) {
+        translatedParts = await Promise.all(
+          missingTxt.map((t) => googleTranslate(t, lang).catch(() => t))
+        );
+      }
+    } catch {
+      translatedParts = await Promise.all(
+        missingTxt.map((t) => googleTranslate(t, lang).catch(() => t))
+      );
+    }
+    for (let j = 0; j < missingIdx.length; j++) {
+      const i = missingIdx[j];
+      const tr = (translatedParts[j] ?? missingTxt[j]).trim();
+      result[i] = tr;
+      cachePut(`${lang}|btn|${missingTxt[j]}`, tr);
+    }
+  }
+  return result;
+}
+
 async function translateInlineKeyboard(rm: any, lang: string): Promise<any> {
   if (!rm || !Array.isArray(rm.inline_keyboard)) return rm;
-  const newRows: any[][] = [];
-  for (const row of rm.inline_keyboard) {
-    if (!Array.isArray(row)) {
-      newRows.push(row);
-      continue;
-    }
-    const newRow: any[] = [];
-    for (const btn of row) {
+  // Collect all button labels first.
+  const labels: string[] = [];
+  const positions: Array<{ r: number; c: number }> = [];
+  for (let r = 0; r < rm.inline_keyboard.length; r++) {
+    const row = rm.inline_keyboard[r];
+    if (!Array.isArray(row)) continue;
+    for (let c = 0; c < row.length; c++) {
+      const btn = row[c];
       if (btn && typeof btn === "object" && typeof btn.text === "string") {
-        const translated = await translatePlain(btn.text, lang);
-        newRow.push({ ...btn, text: translated });
-      } else {
-        newRow.push(btn);
+        labels.push(btn.text);
+        positions.push({ r, c });
       }
     }
-    newRows.push(newRow);
+  }
+  if (labels.length === 0) return rm;
+  const translated = await translateBatch(labels, lang);
+  const newRows: any[][] = rm.inline_keyboard.map((row: any) =>
+    Array.isArray(row) ? row.slice() : row
+  );
+  for (let i = 0; i < positions.length; i++) {
+    const { r, c } = positions[i];
+    const btn = newRows[r][c];
+    newRows[r][c] = { ...btn, text: translated[i] };
   }
   return { ...rm, inline_keyboard: newRows };
 }
@@ -285,17 +343,21 @@ export function makeTranslateTransformer() {
       if (userId !== undefined) {
         const lang = await getUserLang(userId);
         if (lang !== "default") {
-          let next = payload;
-          if (typeof next.text === "string") {
-            next = { ...next, text: await translateHtml(next.text, lang) };
-          }
-          if (typeof next.caption === "string") {
-            next = { ...next, caption: await translateHtml(next.caption, lang) };
-          }
-          if (next.reply_markup && typeof next.reply_markup === "object") {
-            next = { ...next, reply_markup: await translateInlineKeyboard(next.reply_markup, lang) };
-          }
-          payload = next;
+          const [textOut, captionOut, rmOut] = await Promise.all([
+            typeof payload.text === "string"
+              ? translateHtml(payload.text, lang).catch(() => payload.text)
+              : Promise.resolve(payload.text),
+            typeof payload.caption === "string"
+              ? translateHtml(payload.caption, lang).catch(() => payload.caption)
+              : Promise.resolve(payload.caption),
+            payload.reply_markup && typeof payload.reply_markup === "object"
+              ? translateInlineKeyboard(payload.reply_markup, lang).catch(() => payload.reply_markup)
+              : Promise.resolve(payload.reply_markup),
+          ]);
+          payload = { ...payload };
+          if (typeof textOut === "string") payload.text = textOut;
+          if (typeof captionOut === "string") payload.caption = captionOut;
+          if (rmOut !== undefined) payload.reply_markup = rmOut;
         }
       }
     }
