@@ -87,7 +87,9 @@ function getButtonStyle(text: string, callbackData?: string): TelegramButtonStyl
     value.includes("clear") ||
     value.includes("stop") ||
     value.includes("❌") ||
-    value.includes("🗑")
+    value.includes("🗑") ||
+    value.includes("🇮🇩") ||
+    value.includes("🇨🇳")
   ) {
     return "danger";
   }
