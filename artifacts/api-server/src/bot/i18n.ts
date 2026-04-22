@@ -140,45 +140,32 @@ function googleTranslate(text: string, target: string): Promise<string> {
   });
 }
 
-// HTML-aware translator: preserves Telegram HTML tags and <code>/<pre> contents.
+// HTML-aware translator: preserves all HTML tags (including <pre>/<code>) but
+// translates ALL inner text content — including text inside <pre> and <code>
+// blocks, since the bot uses <pre> for formatted help text that the user
+// actually wants translated.
+//
 // Strategy:
-//   1. Extract <pre>...</pre> and <code>...</code> blocks → placeholders (content preserved verbatim).
-//   2. Extract remaining HTML tags → placeholders.
-//   3. Translate the resulting plain text.
-//   4. Restore placeholders.
+//   1. Replace each HTML tag with a placeholder (tag itself preserved).
+//   2. Translate the resulting text (with placeholders) as a whole.
+//   3. Restore tag placeholders.
 async function translateHtml(text: string, target: string): Promise<string> {
   if (!text || !text.trim()) return text;
 
-  const blocks: string[] = [];
   const tags: string[] = [];
-
-  // Use ASCII-safe placeholders that Google Translate is unlikely to alter.
-  const blockPh = (i: number) => `[[BB${i}BB]]`;
   const tagPh = (i: number) => `[[TT${i}TT]]`;
 
-  // 1) Preserve <pre>...</pre> and <code>...</code> verbatim
-  let processed = text.replace(
-    /<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>/gi,
-    (m) => {
-      blocks.push(m);
-      return blockPh(blocks.length - 1);
-    }
-  );
-
-  // 2) Replace remaining HTML tags
-  processed = processed.replace(/<\/?[a-zA-Z][^>]*>/g, (m) => {
+  // Replace every HTML tag with a placeholder; translate inner text.
+  let processed = text.replace(/<\/?[a-zA-Z][^>]*>/g, (m) => {
     tags.push(m);
     return tagPh(tags.length - 1);
   });
 
   // Quick check: if nothing meaningful to translate
-  const stripped = processed
-    .replace(/\[\[BB\d+BB\]\]/g, "")
-    .replace(/\[\[TT\d+TT\]\]/g, "")
-    .trim();
+  const stripped = processed.replace(/\[\[TT\d+TT\]\]/g, "").trim();
   if (!stripped) return text;
 
-  // 3) Translate
+  // Translate (with cache)
   let translated: string;
   const cacheKey = `${target}|${processed}`;
   const cached = translateCache.get(cacheKey);
@@ -189,17 +176,25 @@ async function translateHtml(text: string, target: string): Promise<string> {
     cachePut(cacheKey, translated);
   }
 
-  // 4) Restore placeholders. Google sometimes adds spaces/case-changes inside brackets.
-  translated = translated.replace(/\[\s*\[\s*BB\s*(\d+)\s*BB\s*\]\s*\]/gi, (_m, i) => {
-    const idx = Number(i);
-    return blocks[idx] !== undefined ? blocks[idx] : _m;
-  });
+  // Restore tag placeholders. Google sometimes adds spaces/case-changes inside brackets.
   translated = translated.replace(/\[\s*\[\s*TT\s*(\d+)\s*TT\s*\]\s*\]/gi, (_m, i) => {
     const idx = Number(i);
     return tags[idx] !== undefined ? tags[idx] : _m;
   });
 
   return translated;
+}
+
+// Translate a single short string (for inline keyboard button labels and
+// callback-query toast text). Uses the same cache. Skips empty / lang=default.
+async function translatePlain(text: string, target: string): Promise<string> {
+  if (!text || !text.trim()) return text;
+  const cacheKey = `${target}|btn|${text}`;
+  const cached = translateCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const out = await googleTranslate(text, target);
+  cachePut(cacheKey, out);
+  return out;
 }
 
 export async function translateForUser(text: string, userId: number | undefined): Promise<string> {
@@ -241,6 +236,42 @@ function extractUserId(payload: any): number | undefined {
   return undefined;
 }
 
+// Methods that can carry a reply_markup with inline keyboard buttons.
+const REPLY_MARKUP_METHODS = new Set([
+  "sendMessage",
+  "editMessageText",
+  "editMessageReplyMarkup",
+  "editMessageCaption",
+  "sendPhoto",
+  "sendDocument",
+  "sendVideo",
+  "sendAudio",
+  "sendAnimation",
+  "sendVoice",
+]);
+
+async function translateInlineKeyboard(rm: any, lang: string): Promise<any> {
+  if (!rm || !Array.isArray(rm.inline_keyboard)) return rm;
+  const newRows: any[][] = [];
+  for (const row of rm.inline_keyboard) {
+    if (!Array.isArray(row)) {
+      newRows.push(row);
+      continue;
+    }
+    const newRow: any[] = [];
+    for (const btn of row) {
+      if (btn && typeof btn === "object" && typeof btn.text === "string") {
+        const translated = await translatePlain(btn.text, lang);
+        newRow.push({ ...btn, text: translated });
+      } else {
+        newRow.push(btn);
+      }
+    }
+    newRows.push(newRow);
+  }
+  return { ...rm, inline_keyboard: newRows };
+}
+
 export function makeTranslateTransformer() {
   return async function translateTransformer(
     prev: (method: string, payload: any, signal?: AbortSignal) => Promise<any>,
@@ -248,17 +279,23 @@ export function makeTranslateTransformer() {
     payload: any,
     signal?: AbortSignal
   ) {
-    if (TRANSLATABLE_METHODS.has(method) && payload && typeof payload === "object") {
+    if ((TRANSLATABLE_METHODS.has(method) || REPLY_MARKUP_METHODS.has(method))
+        && payload && typeof payload === "object") {
       const userId = extractUserId(payload);
       if (userId !== undefined) {
         const lang = await getUserLang(userId);
         if (lang !== "default") {
-          if (typeof payload.text === "string") {
-            payload = { ...payload, text: await translateHtml(payload.text, lang) };
+          let next = payload;
+          if (typeof next.text === "string") {
+            next = { ...next, text: await translateHtml(next.text, lang) };
           }
-          if (typeof payload.caption === "string") {
-            payload = { ...payload, caption: await translateHtml(payload.caption, lang) };
+          if (typeof next.caption === "string") {
+            next = { ...next, caption: await translateHtml(next.caption, lang) };
           }
+          if (next.reply_markup && typeof next.reply_markup === "object") {
+            next = { ...next, reply_markup: await translateInlineKeyboard(next.reply_markup, lang) };
+          }
+          payload = next;
         }
       }
     }
