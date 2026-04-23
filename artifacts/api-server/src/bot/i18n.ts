@@ -457,6 +457,9 @@ export function makeTranslateTransformer() {
   ) {
     if ((TRANSLATABLE_METHODS.has(method) || REPLY_MARKUP_METHODS.has(method))
         && payload && typeof payload === "object") {
+      const _uid = extractUserId(payload);
+      const _lang = _uid !== undefined ? await getUserLang(_uid) : "default";
+      console.log(`[i18n] ${method} uid=${_uid} lang=${_lang} hasText=${typeof payload.text==="string"} hasCaption=${typeof payload.caption==="string"} hasRM=${!!payload.reply_markup}`);
       // If text/caption starts with skip marker, strip it and bypass translation.
       let bypass = false;
       if (typeof payload.text === "string" && payload.text.startsWith(SKIP_TRANSLATE_MARKER)) {
