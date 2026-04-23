@@ -457,9 +457,6 @@ export function makeTranslateTransformer() {
   ) {
     if ((TRANSLATABLE_METHODS.has(method) || REPLY_MARKUP_METHODS.has(method))
         && payload && typeof payload === "object") {
-      const _uid = extractUserId(payload);
-      const _lang = _uid !== undefined ? await getUserLang(_uid) : "default";
-      console.log(`[i18n] ${method} uid=${_uid} lang=${_lang} hasText=${typeof payload.text==="string"} hasCaption=${typeof payload.caption==="string"} hasRM=${!!payload.reply_markup}`);
       // If text/caption starts with skip marker, strip it and bypass translation.
       let bypass = false;
       if (typeof payload.text === "string" && payload.text.startsWith(SKIP_TRANSLATE_MARKER)) {
@@ -481,7 +478,10 @@ export function makeTranslateTransformer() {
             !bypass && typeof payload.caption === "string"
               ? translateHtml(payload.caption, lang).catch(() => payload.caption)
               : Promise.resolve(payload.caption),
-            payload.reply_markup && typeof payload.reply_markup === "object"
+            // When bypass=true (SKIP_TRANSLATE_MARKER present), skip keyboard translation too.
+            // This is important for the /language menu — button labels must stay in their
+            // original language so users can identify which option to pick.
+            !bypass && payload.reply_markup && typeof payload.reply_markup === "object"
               ? translateInlineKeyboard(payload.reply_markup, lang).catch(() => payload.reply_markup)
               : Promise.resolve(payload.reply_markup),
           ]);
