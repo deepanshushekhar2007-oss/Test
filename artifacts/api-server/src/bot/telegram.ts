@@ -979,7 +979,7 @@ bot.command("help", async (ctx) => {
     `• 3 modes:\n` +
     `   👆 Add 1 by 1 (safe, with delay)\n` +
     `   👥 Add Together (fast, ek baar mein)\n` +
-    `   🎯 Custom — har category ke liye apni pace (1-1, 2-2, 3-3 ya All)\n` +
+    `   🎯 Custom — har category ke liye apni pace (1-1, 2-2, 3-3, 4-4, 5-5, 6-6, 7-7, 8-8, 9-9, 10-10, 15-15, 20-20 ya All)\n` +
     `• Sirf wahi categories show hoti hain jinka VCF ya numbers diya ho\n` +
     `  (e.g. Admin VCF nahi diya to Admin option nahi dikhega)\n` +
     `• Fail hone par specific reason dikhta hai:\n` +
@@ -1030,15 +1030,71 @@ bot.command("help", async (ctx) => {
     `• 🔌 Agar aapka WhatsApp disconnect ho jaye to aapko ek alert message milega\n` +
     `  (English mein, aapke WhatsApp number ke saath)`;
 
-  const helpText =
-    `👤 <b>Owner:</b> ${OWNER_USERNAME}\n\n` +
-    `<pre>${codeBlock}</pre>\n\n` +
-    `👤 <b>Owner:</b> ${OWNER_USERNAME}`;
-
-  await ctx.reply(helpText, {
+  // Telegram has a 4096-character limit per message. The full help guide
+  // exceeds that when wrapped in <pre>, so we split it into chunks on
+  // section boundaries (double newlines) and show one page at a time
+  // with Next / Previous buttons. Content stays in <pre> (copy-code) format.
+  const chunks = splitHelpIntoChunks(codeBlock);
+  helpPages.set(userId, chunks);
+  await ctx.reply(renderHelpPage(chunks, 0), {
     parse_mode: "HTML",
-    reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    reply_markup: buildHelpKeyboard(0, chunks.length),
   });
+});
+
+// ─── Help pagination ──────────────────────────────────────────────────────────
+const helpPages: Map<number, string[]> = new Map();
+const HELP_MAX_CHUNK = 3500; // safe budget under Telegram's 4096-char limit
+
+function splitHelpIntoChunks(codeBlock: string): string[] {
+  const sections = codeBlock.split("\n\n");
+  const chunks: string[] = [];
+  let current = "";
+  for (const sec of sections) {
+    const piece = current ? current + "\n\n" + sec : sec;
+    if (piece.length > HELP_MAX_CHUNK && current) {
+      chunks.push(current);
+      current = sec;
+    } else {
+      current = piece;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function renderHelpPage(chunks: string[], page: number): string {
+  const ownerLine = `👤 <b>Owner:</b> ${OWNER_USERNAME}`;
+  const pageInfo = `📄 <b>Page ${page + 1} / ${chunks.length}</b>`;
+  return `${ownerLine}\n${pageInfo}\n\n<pre>${chunks[page]}</pre>`;
+}
+
+function buildHelpKeyboard(page: number, total: number): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (total > 1) {
+    if (page > 0) kb.text("⬅️ Previous", `help_pg_${page - 1}`);
+    if (page < total - 1) kb.text("Next ➡️", `help_pg_${page + 1}`);
+    kb.row();
+  }
+  kb.text("🏠 Main Menu", "main_menu");
+  return kb;
+}
+
+bot.callbackQuery(/^help_pg_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from!.id;
+  const page = Number(ctx.match![1]);
+  const chunks = helpPages.get(userId);
+  if (!chunks || page < 0 || page >= chunks.length) {
+    try { await ctx.answerCallbackQuery({ text: "Help session expired. Send /help again.", show_alert: true }); } catch {}
+    return;
+  }
+  try {
+    await ctx.editMessageText(renderHelpPage(chunks, page), {
+      parse_mode: "HTML",
+      reply_markup: buildHelpKeyboard(page, chunks.length),
+    });
+  } catch {}
 });
 
 async function checkAccessMiddleware(ctx: any): Promise<boolean> {
@@ -5642,6 +5698,9 @@ async function showCustomBatchPrompt(ctx: any, userId: number) {
     `Ek baar mein kitne add karein?`;
   const kb = new InlineKeyboard()
     .text("1-1", "am_cb_1").text("2-2", "am_cb_2").text("3-3", "am_cb_3").row()
+    .text("4-4", "am_cb_4").text("5-5", "am_cb_5").text("6-6", "am_cb_6").row()
+    .text("7-7", "am_cb_7").text("8-8", "am_cb_8").text("9-9", "am_cb_9").row()
+    .text("10-10", "am_cb_10").text("15-15", "am_cb_15").text("20-20", "am_cb_20").row()
     .text("✅ All Together", "am_cb_all").text("❌ Cancel", "main_menu");
   try { await ctx.editMessageText(text, { parse_mode: "HTML", reply_markup: kb }); }
   catch { await ctx.reply(text, { parse_mode: "HTML", reply_markup: kb }); }
@@ -5661,7 +5720,13 @@ bot.callbackQuery("am_mode_custom", async (ctx) => {
   await showCustomBatchPrompt(ctx, userId);
 });
 
-for (const [cb, val] of [["am_cb_1", 1], ["am_cb_2", 2], ["am_cb_3", 3], ["am_cb_all", -1]] as const) {
+for (const [cb, val] of [
+  ["am_cb_1", 1], ["am_cb_2", 2], ["am_cb_3", 3],
+  ["am_cb_4", 4], ["am_cb_5", 5], ["am_cb_6", 6],
+  ["am_cb_7", 7], ["am_cb_8", 8], ["am_cb_9", 9],
+  ["am_cb_10", 10], ["am_cb_15", 15], ["am_cb_20", 20],
+  ["am_cb_all", -1],
+] as const) {
   bot.callbackQuery(cb, async (ctx) => {
     await ctx.answerCallbackQuery();
     const userId = ctx.from.id;
