@@ -1065,25 +1065,15 @@ bot.command("help", async (ctx) => {
     `• Connect WhatsApp mein number kisi bhi format mein de sakte ho\n` +
     `  (+91 9999-999999, +919999999999 — sab chalega)`;
 
+  // Plain text (no HTML parse_mode) so translation can never break parsing.
   const helpText =
-    `👤 <b>Owner:</b> ${esc(OWNER_USERNAME)}\n\n` +
-    `<pre>${esc(codeBlock)}</pre>\n\n` +
-    `👤 <b>Owner:</b> ${esc(OWNER_USERNAME)}`;
+    `👤 Owner: ${OWNER_USERNAME}\n\n` +
+    `${codeBlock}\n\n` +
+    `👤 Owner: ${OWNER_USERNAME}`;
 
-  try {
-    await ctx.reply(helpText, {
-      parse_mode: "HTML",
-      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
-    });
-  } catch (err: any) {
-    console.error("[help] HTML send failed, retrying without parse_mode:", err?.message);
-    // Fallback: send as plain text (translation transformer will still translate it)
-    const plain =
-      `👤 Owner: ${OWNER_USERNAME}\n\n${codeBlock}\n\n👤 Owner: ${OWNER_USERNAME}`;
-    await ctx.reply(plain, {
-      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
-    });
-  }
+  await ctx.reply(helpText, {
+    reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+  });
 });
 
 async function checkAccessMiddleware(ctx: any): Promise<boolean> {
