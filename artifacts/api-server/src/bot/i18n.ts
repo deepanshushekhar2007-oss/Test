@@ -101,20 +101,41 @@ function mapLangForGoogle(target: string): string {
   }
 }
 
-// POST-based translation — supports much longer text than GET (no URL limit).
-function googleTranslateOnce(text: string, target: string): Promise<string> {
+// Returns { text, ok } — ok=false means caller should NOT cache the result
+// (translation failed silently and we returned the original text).
+function googleTranslateOnce(
+  text: string,
+  target: string
+): Promise<{ text: string; ok: boolean }> {
   return new Promise((resolve) => {
-    const params = new URLSearchParams({
+    const tl = mapLangForGoogle(target);
+    // Use GET when URL fits (simpler & more reliable), POST for large text.
+    const useGet = text.length < 1500;
+    const baseParams = new URLSearchParams({
       client: "gtx",
       sl: "auto",
-      tl: mapLangForGoogle(target),
+      tl,
       dt: "t",
     });
-    const url = `https://translate.googleapis.com/translate_a/single?${params.toString()}`;
-    const body = new URLSearchParams({ q: text }).toString();
-    const req = https.request(
-      url,
-      {
+    let url: string;
+    let reqOpts: any;
+    let body: string | null = null;
+    if (useGet) {
+      const p = new URLSearchParams(baseParams);
+      p.set("q", text);
+      url = `https://translate.googleapis.com/translate_a/single?${p}`;
+      reqOpts = {
+        method: "GET",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+          Accept: "*/*",
+        },
+      };
+    } else {
+      url = `https://translate.googleapis.com/translate_a/single?${baseParams}`;
+      body = new URLSearchParams({ q: text }).toString();
+      reqOpts = {
         method: "POST",
         headers: {
           "User-Agent":
@@ -123,36 +144,45 @@ function googleTranslateOnce(text: string, target: string): Promise<string> {
           "Content-Type": "application/x-www-form-urlencoded",
           "Content-Length": Buffer.byteLength(body).toString(),
         },
-      },
-      (res) => {
-        let buf = "";
-        res.on("data", (c) => (buf += c));
-        res.on("end", () => {
-          try {
-            const data = JSON.parse(buf);
-            const segments: string[] = [];
-            if (Array.isArray(data) && Array.isArray(data[0])) {
-              for (const seg of data[0]) {
-                if (Array.isArray(seg) && typeof seg[0] === "string") {
-                  segments.push(seg[0]);
-                }
+      };
+    }
+    const req = https.request(url, reqOpts, (res) => {
+      let buf = "";
+      res.on("data", (c) => (buf += c));
+      res.on("end", () => {
+        if (res.statusCode && res.statusCode >= 400) {
+          console.error(`[i18n] translate HTTP ${res.statusCode} (tl=${tl}, len=${text.length})`);
+          return resolve({ text, ok: false });
+        }
+        try {
+          const data = JSON.parse(buf);
+          const segments: string[] = [];
+          if (Array.isArray(data) && Array.isArray(data[0])) {
+            for (const seg of data[0]) {
+              if (Array.isArray(seg) && typeof seg[0] === "string") {
+                segments.push(seg[0]);
               }
             }
-            resolve(segments.join("") || text);
-          } catch {
-            resolve(text);
           }
-        });
-      }
-    );
-    req.on("error", () => resolve(text));
-    req.setTimeout(15000, () => {
-      try {
-        req.destroy();
-      } catch {}
-      resolve(text);
+          const out = segments.join("");
+          if (!out) return resolve({ text, ok: false });
+          resolve({ text: out, ok: true });
+        } catch (e: any) {
+          console.error(`[i18n] translate parse error (tl=${tl}):`, e?.message);
+          resolve({ text, ok: false });
+        }
+      });
     });
-    req.write(body);
+    req.on("error", (e: any) => {
+      console.error(`[i18n] translate network error (tl=${tl}):`, e?.message);
+      resolve({ text, ok: false });
+    });
+    req.setTimeout(10000, () => {
+      console.error(`[i18n] translate timeout (tl=${tl}, len=${text.length})`);
+      try { req.destroy(); } catch {}
+      resolve({ text, ok: false });
+    });
+    if (body) req.write(body);
     req.end();
   });
 }
@@ -187,13 +217,19 @@ function splitForTranslation(text: string): string[] {
   return chunks;
 }
 
-async function googleTranslate(text: string, target: string): Promise<string> {
+async function googleTranslate(
+  text: string,
+  target: string
+): Promise<{ text: string; ok: boolean }> {
   const chunks = splitForTranslation(text);
   if (chunks.length === 1) return googleTranslateOnce(text, target);
-  const translated = await Promise.all(
+  const results = await Promise.all(
     chunks.map((c) => googleTranslateOnce(c, target))
   );
-  return translated.join("\n");
+  return {
+    text: results.map((r) => r.text).join("\n"),
+    ok: results.every((r) => r.ok),
+  };
 }
 
 // HTML-aware translator: preserves all HTML tags (including <pre>/<code>) but
@@ -221,15 +257,16 @@ async function translateHtml(text: string, target: string): Promise<string> {
   const stripped = processed.replace(/\[\[TT\d+TT\]\]/g, "").trim();
   if (!stripped) return text;
 
-  // Translate (with cache)
+  // Translate (with cache). Don't cache on failure so we retry next time.
   let translated: string;
   const cacheKey = `${target}|${processed}`;
   const cached = translateCache.get(cacheKey);
   if (cached !== undefined) {
     translated = cached;
   } else {
-    translated = await googleTranslate(processed, target);
-    cachePut(cacheKey, translated);
+    const r = await googleTranslate(processed, target);
+    translated = r.text;
+    if (r.ok) cachePut(cacheKey, translated);
   }
 
   // Restore tag placeholders. Google sometimes adds spaces/case-changes inside brackets.
@@ -248,9 +285,9 @@ async function translatePlain(text: string, target: string): Promise<string> {
   const cacheKey = `${target}|btn|${text}`;
   const cached = translateCache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const out = await googleTranslate(text, target);
-  cachePut(cacheKey, out);
-  return out;
+  const r = await googleTranslate(text, target);
+  if (r.ok) cachePut(cacheKey, r.text);
+  return r.text;
 }
 
 // Zero-width sentinel: when a message text/caption STARTS with this marker,
@@ -265,7 +302,8 @@ export async function translatePlainText(text: string, target: string): Promise<
   if (!text || !text.trim()) return text;
   if (target === "default") return text;
   try {
-    return await googleTranslate(text, target);
+    const r = await googleTranslate(text, target);
+    return r.text;
   } catch {
     return text;
   }
@@ -349,27 +387,33 @@ async function translateBatch(texts: string[], lang: string): Promise<string[]> 
   }
   if (missingTxt.length > 0) {
     let translatedParts: string[];
+    let okFlags: boolean[];
     try {
       const joined = missingTxt.join(BATCH_SEP);
-      const out = await googleTranslate(joined, lang);
-      translatedParts = out.split(BATCH_SEP);
-      // Fallback: if separator got mangled and counts don't match, fall back
-      // to per-item translation in parallel.
-      if (translatedParts.length !== missingTxt.length) {
-        translatedParts = await Promise.all(
-          missingTxt.map((t) => googleTranslate(t, lang).catch(() => t))
+      const r = await googleTranslate(joined, lang);
+      const parts = r.text.split(BATCH_SEP);
+      if (r.ok && parts.length === missingTxt.length) {
+        translatedParts = parts;
+        okFlags = parts.map(() => true);
+      } else {
+        const rs = await Promise.all(
+          missingTxt.map((t) => googleTranslate(t, lang))
         );
+        translatedParts = rs.map((x) => x.text);
+        okFlags = rs.map((x) => x.ok);
       }
     } catch {
-      translatedParts = await Promise.all(
-        missingTxt.map((t) => googleTranslate(t, lang).catch(() => t))
+      const rs = await Promise.all(
+        missingTxt.map((t) => googleTranslate(t, lang).catch(() => ({ text: t, ok: false })))
       );
+      translatedParts = rs.map((x) => x.text);
+      okFlags = rs.map((x) => x.ok);
     }
     for (let j = 0; j < missingIdx.length; j++) {
       const i = missingIdx[j];
       const tr = (translatedParts[j] ?? missingTxt[j]).trim();
       result[i] = tr;
-      cachePut(`${lang}|btn|${missingTxt[j]}`, tr);
+      if (okFlags[j]) cachePut(`${lang}|btn|${missingTxt[j]}`, tr);
     }
   }
   return result;
@@ -424,14 +468,14 @@ export function makeTranslateTransformer() {
         bypass = true;
       }
       const userId = extractUserId(payload);
-      if (!bypass && userId !== undefined) {
+      if (userId !== undefined) {
         const lang = await getUserLang(userId);
         if (lang !== "default") {
           const [textOut, captionOut, rmOut] = await Promise.all([
-            typeof payload.text === "string"
+            !bypass && typeof payload.text === "string"
               ? translateHtml(payload.text, lang).catch(() => payload.text)
               : Promise.resolve(payload.text),
-            typeof payload.caption === "string"
+            !bypass && typeof payload.caption === "string"
               ? translateHtml(payload.caption, lang).catch(() => payload.caption)
               : Promise.resolve(payload.caption),
             payload.reply_markup && typeof payload.reply_markup === "object"
