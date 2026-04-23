@@ -55,6 +55,8 @@ import {
   setUserLang,
   preloadLangCache,
   makeTranslateTransformer,
+  translatePlainText,
+  SKIP_TRANSLATE_MARKER,
   type LangCode,
 } from "./i18n";
 
@@ -1065,15 +1067,35 @@ bot.command("help", async (ctx) => {
     `• Connect WhatsApp mein number kisi bhi format mein de sakte ho\n` +
     `  (+91 9999-999999, +919999999999 — sab chalega)`;
 
-  // Plain text (no HTML parse_mode) so translation can never break parsing.
-  const helpText =
-    `👤 Owner: ${OWNER_USERNAME}\n\n` +
-    `${codeBlock}\n\n` +
-    `👤 Owner: ${OWNER_USERNAME}`;
+  // Manually translate the codeBlock contents (plain text — no HTML risk),
+  // then escape and wrap in <pre> so the user sees the same monospace box
+  // format. Prefix with SKIP_TRANSLATE_MARKER so the auto-translator does
+  // NOT touch the already-formatted HTML.
+  const lang = await getUserLang(userId);
+  const translatedCodeBlock =
+    lang === "default" ? codeBlock : await translatePlainText(codeBlock, lang);
+  const translatedOwnerLabel =
+    lang === "default" ? "Owner" : await translatePlainText("Owner", lang);
 
-  await ctx.reply(helpText, {
-    reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
-  });
+  const helpText =
+    SKIP_TRANSLATE_MARKER +
+    `👤 <b>${esc(translatedOwnerLabel)}:</b> ${esc(OWNER_USERNAME)}\n\n` +
+    `<pre>${esc(translatedCodeBlock)}</pre>\n\n` +
+    `👤 <b>${esc(translatedOwnerLabel)}:</b> ${esc(OWNER_USERNAME)}`;
+
+  try {
+    await ctx.reply(helpText, {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+  } catch (err: any) {
+    console.error("[help] HTML send failed, falling back to plain text:", err?.message);
+    await ctx.reply(
+      SKIP_TRANSLATE_MARKER +
+        `👤 ${translatedOwnerLabel}: ${OWNER_USERNAME}\n\n${translatedCodeBlock}\n\n👤 ${translatedOwnerLabel}: ${OWNER_USERNAME}`,
+      { reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+    );
+  }
 });
 
 async function checkAccessMiddleware(ctx: any): Promise<boolean> {

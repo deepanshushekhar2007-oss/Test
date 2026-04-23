@@ -242,6 +242,24 @@ async function translatePlain(text: string, target: string): Promise<string> {
   return out;
 }
 
+// Zero-width sentinel: when a message text/caption STARTS with this marker,
+// the translate transformer strips it and skips translation. Use this when
+// the caller has already manually translated the message and wants to ship
+// raw HTML (e.g. /help with a <pre> code block).
+export const SKIP_TRANSLATE_MARKER = "\u200B\u200B__NOTL__\u200B\u200B";
+
+// Direct access to the translation engine for callers that want to translate
+// content themselves (e.g. plain code-block contents) before formatting.
+export async function translatePlainText(text: string, target: string): Promise<string> {
+  if (!text || !text.trim()) return text;
+  if (target === "default") return text;
+  try {
+    return await googleTranslate(text, target);
+  } catch {
+    return text;
+  }
+}
+
 export async function translateForUser(text: string, userId: number | undefined): Promise<string> {
   if (!text || userId === undefined) return text;
   const lang = await getUserLang(userId);
@@ -384,8 +402,18 @@ export function makeTranslateTransformer() {
   ) {
     if ((TRANSLATABLE_METHODS.has(method) || REPLY_MARKUP_METHODS.has(method))
         && payload && typeof payload === "object") {
+      // If text/caption starts with skip marker, strip it and bypass translation.
+      let bypass = false;
+      if (typeof payload.text === "string" && payload.text.startsWith(SKIP_TRANSLATE_MARKER)) {
+        payload = { ...payload, text: payload.text.slice(SKIP_TRANSLATE_MARKER.length) };
+        bypass = true;
+      }
+      if (typeof payload.caption === "string" && payload.caption.startsWith(SKIP_TRANSLATE_MARKER)) {
+        payload = { ...payload, caption: payload.caption.slice(SKIP_TRANSLATE_MARKER.length) };
+        bypass = true;
+      }
       const userId = extractUserId(payload);
-      if (userId !== undefined) {
+      if (!bypass && userId !== undefined) {
         const lang = await getUserLang(userId);
         if (lang !== "default") {
           const [textOut, captionOut, rmOut] = await Promise.all([
