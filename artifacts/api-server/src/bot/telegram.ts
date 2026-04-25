@@ -2548,7 +2548,7 @@ function detectSimilarGroups(groups: Array<{ id: string; subject: string }>): Si
   return Array.from(map.entries())
     .filter(([, items]) => items.length >= 2)
     .map(([, items]) => {
-      const sorted = items.sort((a, b) => a.subject.localeCompare(b.subject));
+      const sorted = items.sort((a, b) => a.subject.localeCompare(b.subject, undefined, { numeric: true, sensitivity: "base" }));
       return { base: sorted[0].subject.replace(/\s*\d+\s*$/, "").trim(), groups: sorted };
     })
     .sort((a, b) => a.base.localeCompare(b.base));
@@ -2574,7 +2574,7 @@ bot.callbackQuery("get_link", async (ctx) => {
   }
 
   const adminGroups = groups.filter((g) => g.isAdmin);
-  const allGroupsSimple = adminGroups.map((g) => ({ id: g.id, subject: g.subject })).sort((a, b) => a.subject.localeCompare(b.subject));
+  const allGroupsSimple = adminGroups.map((g) => ({ id: g.id, subject: g.subject })).sort((a, b) => a.subject.localeCompare(b.subject, undefined, { numeric: true, sensitivity: "base" }));
   const patterns = detectSimilarGroups(allGroupsSimple);
 
   userStates.set(userId, {
@@ -2746,8 +2746,8 @@ async function fetchGroupLinksBackground(
 
   if (wasCancelled) result += "⛔ <b>Fetch stopped by user.</b>\n\n";
 
-  const successResults = results.filter((r) => r.link).sort((a, b) => a.subject.localeCompare(b.subject));
-  const failedResults = results.filter((r) => !r.link).sort((a, b) => a.subject.localeCompare(b.subject));
+  const successResults = results.filter((r) => r.link).sort((a, b) => a.subject.localeCompare(b.subject, undefined, { numeric: true, sensitivity: "base" }));
+  const failedResults = results.filter((r) => !r.link).sort((a, b) => a.subject.localeCompare(b.subject, undefined, { numeric: true, sensitivity: "base" }));
 
   for (const r of successResults) {
     result += `📌 ${esc(r.subject)}\n${r.link}\n\n`;
