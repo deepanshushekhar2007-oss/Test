@@ -400,6 +400,10 @@ interface UserState {
     patterns: SimilarGroup[];
     selectedIndices: Set<number>;
     page?: number;
+    // Admin Approval flow extension:
+    mode?: "all" | "admin_specific";
+    targetPhones?: string[];
+    makeAdminAfter?: boolean;
   };
   addMembersData?: {
     groupLink: string;
@@ -3708,10 +3712,38 @@ bot.callbackQuery("ap_proceed", async (ctx) => {
   if (!state?.approvalData || state.approvalData.selectedIndices.size === 0) return;
 
   const selectedGroups = Array.from(state.approvalData.selectedIndices).map(i => state.approvalData!.allGroups[i]);
-  const groupList = selectedGroups.map(g => `• ${esc(g.subject)}`).join("\n");
+  const preview = selectedGroups.slice(0, 30).map(g => `• ${esc(g.subject)}`).join("\n");
+  const moreText = selectedGroups.length > 30 ? `\n... +${selectedGroups.length - 30} more group(s)` : "";
 
   await ctx.editMessageText(
-    `✅ <b>${selectedGroups.length} group(s) selected:</b>\n\n${groupList}\n\n` +
+    `✅ <b>${selectedGroups.length} group(s) selected:</b>\n\n${preview}${moreText}\n\n` +
+    `📌 <b>Choose approval type:</b>\n\n` +
+    `• <b>👥 All Approval</b> — Approve every pending member in the selected groups (1 by 1 or all together)\n` +
+    `• <b>👑 Admin Approval</b> — Approve only specific numbers (from a VCF or a list) and optionally also make them admin`,
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("👥 All Approval", "ap_type_all")
+        .text("👑 Admin Approval", "ap_type_admin")
+        .row()
+        .text("❌ Cancel", "main_menu"),
+    }
+  );
+});
+
+bot.callbackQuery("ap_type_all", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.approvalData || state.approvalData.selectedIndices.size === 0) return;
+  state.approvalData.mode = "all";
+
+  const selectedGroups = Array.from(state.approvalData.selectedIndices).map(i => state.approvalData!.allGroups[i]);
+  const preview = selectedGroups.slice(0, 30).map(g => `• ${esc(g.subject)}`).join("\n");
+  const moreText = selectedGroups.length > 30 ? `\n... +${selectedGroups.length - 30} more group(s)` : "";
+
+  await ctx.editMessageText(
+    `👥 <b>All Approval — ${selectedGroups.length} group(s):</b>\n\n${preview}${moreText}\n\n` +
     `📌 <b>Choose approval method:</b>\n\n` +
     `• <b>Approve 1 by 1</b> — Approve each pending member one at a time\n` +
     `• <b>Approve Together</b> — Turn off approval setting, then turn it back on to approve all at once`,
@@ -3721,10 +3753,260 @@ bot.callbackQuery("ap_proceed", async (ctx) => {
         .text("☝️ Approve 1 by 1", "ap_one_by_one")
         .text("👥 Approve Together", "ap_together")
         .row()
-        .text("❌ Cancel", "main_menu"),
+        .text("🔙 Back", "ap_proceed").text("❌ Cancel", "main_menu"),
     }
   );
 });
+
+// ─── Admin Approval (specific numbers, optional make-admin) ──────────────────
+bot.callbackQuery("ap_type_admin", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.approvalData || state.approvalData.selectedIndices.size === 0) return;
+
+  state.approvalData.mode = "admin_specific";
+  state.approvalData.targetPhones = undefined;
+  state.approvalData.makeAdminAfter = undefined;
+  state.step = "approval_admin_input";
+
+  const selectedGroups = Array.from(state.approvalData.selectedIndices).map(i => state.approvalData!.allGroups[i]);
+  const preview = selectedGroups.slice(0, 30).map(g => `• ${esc(g.subject)}`).join("\n");
+  const moreText = selectedGroups.length > 30 ? `\n... +${selectedGroups.length - 30} more group(s)` : "";
+
+  await ctx.editMessageText(
+    `👑 <b>Admin Approval — ${selectedGroups.length} group(s):</b>\n\n${preview}${moreText}\n\n` +
+    `📁 <b>Send a VCF file</b> OR <b>send phone numbers</b> (one per line, with country code).\n\n` +
+    `Only these numbers will be approved across the selected groups.\n\n` +
+    `Example:\n<code>+919912345678\n+919998887777</code>`,
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("🔙 Back", "ap_proceed").text("❌ Cancel", "main_menu"),
+    }
+  );
+});
+
+async function showAdminApprovalChoice(ctx: any, userId: number) {
+  const state = userStates.get(userId);
+  if (!state?.approvalData?.targetPhones?.length) return;
+  state.step = "approval_admin_choice";
+  const phones = state.approvalData.targetPhones;
+  const phonePreview = phones.slice(0, 10).map(p => `• +${p}`).join("\n");
+  const phoneMore = phones.length > 10 ? `\n... +${phones.length - 10} more` : "";
+
+  await ctx.reply(
+    `✅ <b>${phones.length} number(s) received</b>\n\n${phonePreview}${phoneMore}\n\n` +
+    `📌 <b>After approval, what should I do?</b>\n\n` +
+    `• <b>Approve only</b> — Just approve these numbers in the selected groups\n` +
+    `• <b>Approve + Make Admin</b> — Approve them, then also promote them to admin in those groups`,
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("✅ Approve only", "ap_admin_no_make")
+        .text("👑 Approve + Make Admin", "ap_admin_make")
+        .row()
+        .text("❌ Cancel", "main_menu"),
+    }
+  );
+}
+
+bot.callbackQuery("ap_admin_no_make", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.approvalData?.targetPhones?.length) return;
+  state.approvalData.makeAdminAfter = false;
+  await showAdminApprovalReview(ctx, userId);
+});
+
+bot.callbackQuery("ap_admin_make", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.approvalData?.targetPhones?.length) return;
+  state.approvalData.makeAdminAfter = true;
+  await showAdminApprovalReview(ctx, userId);
+});
+
+async function showAdminApprovalReview(ctx: any, userId: number) {
+  const state = userStates.get(userId);
+  if (!state?.approvalData?.targetPhones?.length) return;
+  state.step = "approval_admin_review";
+
+  const selectedGroups = Array.from(state.approvalData.selectedIndices).map(i => state.approvalData!.allGroups[i]);
+  const groupPreview = selectedGroups.slice(0, 20).map(g => `• ${esc(g.subject)}`).join("\n");
+  const groupMore = selectedGroups.length > 20 ? `\n... +${selectedGroups.length - 20} more group(s)` : "";
+
+  const phones = state.approvalData.targetPhones;
+  const phonePreview = phones.slice(0, 15).map(p => `• +${p}`).join("\n");
+  const phoneMore = phones.length > 15 ? `\n... +${phones.length - 15} more` : "";
+
+  const actionLine = state.approvalData.makeAdminAfter
+    ? "✅ Approve <b>and</b> 👑 make admin"
+    : "✅ Approve only";
+
+  await ctx.editMessageText(
+    `📋 <b>Review — Admin Approval</b>\n\n` +
+    `<b>Groups (${selectedGroups.length}):</b>\n${groupPreview}${groupMore}\n\n` +
+    `<b>Numbers (${phones.length}):</b>\n${phonePreview}${phoneMore}\n\n` +
+    `<b>Action:</b> ${actionLine}\n\n` +
+    `Tap <b>Confirm</b> to start.`,
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("✅ Confirm & Start", "ap_admin_confirm")
+        .text("❌ Cancel", "main_menu"),
+    }
+  );
+}
+
+bot.callbackQuery("ap_admin_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.approvalData?.targetPhones?.length) return;
+
+  const selectedGroups = Array.from(state.approvalData.selectedIndices).map(i => state.approvalData!.allGroups[i]);
+  const phones = state.approvalData.targetPhones.slice();
+  const makeAdminAfter = !!state.approvalData.makeAdminAfter;
+
+  const chatId = ctx.callbackQuery.message?.chat.id;
+  const msgId = ctx.callbackQuery.message?.message_id;
+  if (!chatId || !msgId) return;
+
+  userStates.delete(userId);
+  await ctx.editMessageText(
+    `⏳ <b>${makeAdminAfter ? "Approving + making admin" : "Approving"} ${phones.length} number(s) in ${selectedGroups.length} group(s)...</b>\n\n⌛ Please wait...`,
+    { parse_mode: "HTML" }
+  );
+  void approveAdminSpecificBackground(String(userId), selectedGroups, phones, makeAdminAfter, chatId, msgId);
+});
+
+async function approveAdminSpecificBackground(
+  userId: string,
+  groups: Array<{ id: string; subject: string }>,
+  phones: string[],
+  makeAdminAfter: boolean,
+  chatId: number,
+  msgId: number,
+) {
+  const normalizedTargets = new Set(phones.map(p => p.replace(/[^0-9]/g, "")));
+  const titleLabel = makeAdminAfter ? "✅ Admin Approval (Approve + Make Admin) Result" : "✅ Admin Approval (Approve only) Result";
+  let fullResult = `<b>${titleLabel}</b>\n\n`;
+  const lines: string[] = [];
+
+  for (let gi = 0; gi < groups.length; gi++) {
+    const group = groups[gi];
+
+    try {
+      await bot.api.editMessageText(chatId, msgId,
+        `⏳ <b>Group ${gi + 1}/${groups.length}: ${esc(group.subject)}</b>\n\n⌛ Fetching pending list...`,
+        { parse_mode: "HTML" }
+      );
+    } catch {}
+
+    const pendingJids = await getGroupPendingRequestsJids(userId, group.id);
+    // Match pending JIDs whose local part matches one of the supplied phones.
+    // (LID-mode groups don't expose phone in JID; those won't match — we report them as not found.)
+    const matched: Array<{ jid: string; phone: string }> = [];
+    const matchedTargets = new Set<string>();
+    for (const jid of pendingJids) {
+      const local = jid.split("@")[0].replace(/:\d+$/, "");
+      if (/^\d+$/.test(local) && normalizedTargets.has(local)) {
+        matched.push({ jid, phone: local });
+        matchedTargets.add(local);
+      }
+    }
+    const notFound = Array.from(normalizedTargets).filter(p => !matchedTargets.has(p));
+
+    const groupLines: string[] = [];
+    let approved = 0, approveFailed = 0;
+
+    if (matched.length === 0) {
+      groupLines.push(`  ⚠️ None of the supplied numbers were in this group's pending list`);
+    } else {
+      for (let mi = 0; mi < matched.length; mi++) {
+        const { jid, phone } = matched[mi];
+        const ok = await approveGroupParticipant(userId, group.id, jid);
+        if (ok) {
+          approved++;
+          groupLines.push(`  ✅ +${phone} — Approved`);
+        } else {
+          approveFailed++;
+          groupLines.push(`  ❌ +${phone} — Approval failed`);
+        }
+        if (mi % 3 === 0 || mi === matched.length - 1) {
+          try {
+            await bot.api.editMessageText(chatId, msgId,
+              `⏳ <b>Group ${gi + 1}/${groups.length}: ${esc(group.subject)}</b>\n\n` +
+              `Approving: ${mi + 1}/${matched.length}\n` +
+              `✅ Approved: ${approved} | ❌ Failed: ${approveFailed}`,
+              { parse_mode: "HTML" }
+            );
+          } catch {}
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+
+    for (const np of notFound) {
+      groupLines.push(`  ⚠️ +${np} — Not in pending list`);
+    }
+
+    let madeAdmin = 0, adminFailed = 0;
+    if (makeAdminAfter && matched.length > 0) {
+      try {
+        await bot.api.editMessageText(chatId, msgId,
+          `⏳ <b>Group ${gi + 1}/${groups.length}: ${esc(group.subject)}</b>\n\n👑 Promoting approved members to admin...`,
+          { parse_mode: "HTML" }
+        );
+      } catch {}
+      // Small wait so the participant lookup picks up newly-approved members
+      await new Promise((r) => setTimeout(r, 1500));
+
+      for (const { phone } of matched) {
+        const participantJid = await findParticipantByPhone(userId, group.id, phone);
+        if (!participantJid) {
+          adminFailed++;
+          groupLines.push(`  ⚠️ +${phone} — Approved, but not found for admin promotion`);
+          continue;
+        }
+        const ok = await makeGroupAdmin(userId, group.id, participantJid);
+        if (ok) {
+          madeAdmin++;
+          groupLines.push(`  👑 +${phone} — Admin granted`);
+        } else {
+          adminFailed++;
+          groupLines.push(`  ❌ +${phone} — Failed to make admin`);
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+
+    const summary = makeAdminAfter
+      ? `✅ Approved: ${approved} | 👑 Admin: ${madeAdmin} | ❌ Failed: ${approveFailed + adminFailed} | ⚠️ Not found: ${notFound.length}`
+      : `✅ Approved: ${approved} | ❌ Failed: ${approveFailed} | ⚠️ Not found: ${notFound.length}`;
+    lines.push(`📋 <b>${esc(group.subject)}</b>\n${groupLines.join("\n")}\n${summary}`);
+  }
+
+  fullResult += lines.join("\n\n");
+  fullResult += `\n\n━━━━━━━━━━━━━━━━━━\n✅ <b>Done processing ${groups.length} group(s)!</b>`;
+
+  const chunks = splitMessage(fullResult, 4000);
+  try {
+    await bot.api.editMessageText(chatId, msgId, chunks[0], {
+      parse_mode: "HTML",
+      reply_markup: chunks.length === 1 ? new InlineKeyboard().text("🏠 Main Menu", "main_menu") : undefined,
+    });
+  } catch {}
+  for (let i = 1; i < chunks.length; i++) {
+    await bot.api.sendMessage(chatId, chunks[i], {
+      parse_mode: "HTML",
+      reply_markup: i === chunks.length - 1 ? new InlineKeyboard().text("🏠 Main Menu", "main_menu") : undefined,
+    });
+  }
+}
 
 bot.callbackQuery("ap_one_by_one", async (ctx) => {
   await ctx.answerCallbackQuery();
@@ -6673,6 +6955,26 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
+  if (state.step === "approval_admin_input") {
+    if (!state.approvalData) return;
+    const phoneLines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+    const phoneNumbers: string[] = [];
+    for (const line of phoneLines) {
+      const cleaned = line.replace(/[^0-9]/g, "");
+      if (cleaned.length >= 7) phoneNumbers.push(cleaned);
+    }
+    if (phoneNumbers.length === 0) {
+      await ctx.reply(
+        "❌ No valid phone numbers found. Please send numbers with country code like +919912345678",
+        { reply_markup: new InlineKeyboard().text("❌ Cancel", "main_menu") }
+      );
+      return;
+    }
+    state.approvalData.targetPhones = phoneNumbers;
+    await showAdminApprovalChoice(ctx, userId);
+    return;
+  }
+
   if (state.step === "make_admin_enter_numbers") {
     if (!state.makeAdminData) return;
     const phoneLines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
@@ -6911,6 +7213,30 @@ bot.on("message:document", async (ctx) => {
   if (!state) return;
   const doc = ctx.message.document;
   if (!(doc.file_name || "").toLowerCase().endsWith(".vcf")) { await ctx.reply("❌ Please send a .vcf file only."); return; }
+
+  if (state.step === "approval_admin_input" && state.approvalData) {
+    try {
+      const file = await ctx.api.getFile(doc.file_id);
+      if (!file.file_path) { await ctx.reply("❌ Could not download file."); return; }
+      const content = await downloadText(`https://api.telegram.org/file/bot${token}/${file.file_path}`);
+      const rawContacts = parseVCF(content);
+      if (!rawContacts.length) { await ctx.reply("❌ No contacts found in VCF file."); return; }
+      const phoneNumbers: string[] = [];
+      for (const c of rawContacts) {
+        const cleaned = (c.phone || "").replace(/[^0-9]/g, "");
+        if (cleaned.length >= 7) phoneNumbers.push(cleaned);
+      }
+      if (phoneNumbers.length === 0) {
+        await ctx.reply("❌ No valid phone numbers found in VCF.");
+        return;
+      }
+      state.approvalData.targetPhones = phoneNumbers;
+      await showAdminApprovalChoice(ctx, userId);
+    } catch (err: any) {
+      await ctx.reply(`❌ Error: ${esc(err?.message || "Unknown")}`, { parse_mode: "HTML" });
+    }
+    return;
+  }
 
   if (["add_members_admin_vcf", "add_members_navy_vcf", "add_members_member_vcf"].includes(state.step) && state.addMembersData) {
     try {
