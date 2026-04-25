@@ -4,6 +4,7 @@ import {
   connectWhatsAppQr,
   isConnected,
   disconnectWhatsApp,
+  refreshWhatsAppSession,
   createWhatsAppGroup,
   applyGroupSettings,
   setGroupIcon,
@@ -854,7 +855,11 @@ function mainMenu(userId?: number): InlineKeyboard {
   if (userId !== undefined && canUserSeeAutoChat(userId)) {
     kb.text("🤖 Auto Chat", "auto_chat_menu").row();
   }
-  kb.text("🔌 Disconnect", "disconnect_wa");
+  if (connected) {
+    kb.text("🔄 Session Refresh", "session_refresh").text("🔌 Disconnect", "disconnect_wa");
+  } else {
+    kb.text("🔌 Disconnect", "disconnect_wa");
+  }
   return kb;
 }
 
@@ -4285,6 +4290,155 @@ async function makeAdminBackground(
     });
   }
 }
+
+// ─── Session Refresh ─────────────────────────────────────────────────────────
+
+bot.callbackQuery("session_refresh", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!isConnected(String(userId))) {
+    await ctx.editMessageText("ℹ️ WhatsApp is not connected.", {
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+  await ctx.editMessageText(
+    "🔄 <b>Session Refresh</b>\n\n" +
+    "This will reconnect your WhatsApp session and reload the <b>LATEST</b> data from WhatsApp:\n\n" +
+    "• 👥 Latest groups (including new ones where you just became admin)\n" +
+    "• 👑 Latest admin status in every group\n" +
+    "• 🔗 Latest invite links\n" +
+    "• 📋 Latest pending requests\n" +
+    "• 📞 Latest contacts\n\n" +
+    "⚠️ Your saved login is <b>NOT</b> deleted — you do <b>NOT</b> need to re-pair. " +
+    "The bot will be paused for ~10–30 seconds while it refreshes.\n\n" +
+    "Do you want to continue?",
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("✅ Yes, Refresh Now", "session_refresh_confirm")
+        .text("❌ Cancel", "main_menu"),
+    }
+  );
+});
+
+const REFRESH_PHASES = [
+  "🔌 Closing existing socket...",
+  "🔐 Loading saved credentials...",
+  "🌐 Reconnecting to WhatsApp servers...",
+  "📥 Syncing latest groups & metadata...",
+  "👑 Refreshing admin status...",
+  "✨ Almost ready...",
+];
+
+function progressBar(percent: number, width = 14): string {
+  const filled = Math.max(0, Math.min(width, Math.round((percent / 100) * width)));
+  return "▰".repeat(filled) + "▱".repeat(width - filled);
+}
+
+bot.callbackQuery("session_refresh_confirm", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!isConnected(String(userId))) {
+    await ctx.editMessageText("ℹ️ WhatsApp is not connected.", {
+      reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu"),
+    });
+    return;
+  }
+
+  const chatId = ctx.callbackQuery.message?.chat.id;
+  const msgId = ctx.callbackQuery.message?.message_id;
+  if (!chatId || !msgId) return;
+
+  const startedAt = Date.now();
+  let done = false;
+  let phaseIdx = 0;
+  let lastRendered = "";
+
+  const renderProgress = async (phase: string, percent: number, extra = "") => {
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    const text =
+      `🔄 <b>Refreshing WhatsApp Session...</b>\n\n` +
+      `${progressBar(percent)} <b>${percent}%</b>\n\n` +
+      `${phase}\n` +
+      `⏱️ Elapsed: ${elapsed}s${extra ? `\n\n${extra}` : ""}`;
+    if (text === lastRendered) return;
+    lastRendered = text;
+    try {
+      await bot.api.editMessageText(chatId, msgId, text, { parse_mode: "HTML" });
+    } catch {}
+  };
+
+  await renderProgress(REFRESH_PHASES[0], 5);
+
+  // Animate the progress bar while we wait for the reconnect to complete.
+  // Caps at 90% until onConnected/onError fires; then we jump to 100% / final state.
+  const ticker = setInterval(async () => {
+    if (done) return;
+    const elapsed = (Date.now() - startedAt) / 1000;
+    // Map elapsed time to percent: ~3s per 10%, capped at 90.
+    const percent = Math.min(90, 5 + Math.floor(elapsed * 3));
+    if (percent >= 15 && phaseIdx < REFRESH_PHASES.length - 1) {
+      phaseIdx = Math.min(REFRESH_PHASES.length - 1, Math.floor(percent / 15));
+    }
+    await renderProgress(REFRESH_PHASES[phaseIdx], percent);
+  }, 1500);
+
+  await refreshWhatsAppSession(
+    String(userId),
+    async () => {
+      done = true;
+      clearInterval(ticker);
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      try {
+        await bot.api.editMessageText(chatId, msgId,
+          `✅ <b>Session Refreshed Successfully!</b>\n\n` +
+          `${progressBar(100)} <b>100%</b>\n\n` +
+          `🎉 All the LATEST WhatsApp data has been loaded:\n` +
+          `• 👥 Groups\n• 👑 Admin status\n• 🔗 Invite links\n• 📋 Pending requests\n\n` +
+          `⏱️ Took: ${elapsed}s\n\n` +
+          `You can now use any feature with the latest data.`,
+          { parse_mode: "HTML", reply_markup: mainMenu(userId) }
+        );
+      } catch {}
+    },
+    async (reason) => {
+      done = true;
+      clearInterval(ticker);
+      try {
+        await bot.api.editMessageText(chatId, msgId,
+          `❌ <b>Session Refresh Failed</b>\n\nReason: ${esc(reason)}\n\n` +
+          `Please try again, or use 🔌 Disconnect and reconnect manually.`,
+          {
+            parse_mode: "HTML",
+            reply_markup: new InlineKeyboard()
+              .text("🔄 Try Again", "session_refresh_confirm")
+              .text("🏠 Main Menu", "main_menu"),
+          }
+        );
+      } catch {}
+    },
+  );
+
+  // Safety timeout — if neither callback fires in 60s, surface a timeout message.
+  setTimeout(async () => {
+    if (done) return;
+    done = true;
+    clearInterval(ticker);
+    try {
+      await bot.api.editMessageText(chatId, msgId,
+        `⚠️ <b>Refresh is taking longer than expected</b>\n\n` +
+        `The reconnect is still running in the background. Try the action again in a few seconds, or use the menu below.`,
+        {
+          parse_mode: "HTML",
+          reply_markup: new InlineKeyboard()
+            .text("🔄 Try Again", "session_refresh_confirm")
+            .text("🏠 Main Menu", "main_menu"),
+        }
+      );
+    } catch {}
+  }, 60_000);
+});
 
 // ─── Disconnect ──────────────────────────────────────────────────────────────
 

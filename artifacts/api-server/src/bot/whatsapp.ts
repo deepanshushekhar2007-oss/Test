@@ -557,6 +557,67 @@ export async function restoreWhatsAppSessions(): Promise<void> {
   }
 }
 
+// Reconnect the existing WhatsApp socket WITHOUT clearing saved credentials.
+// Used by the "Session Refresh" feature to force baileys to re-sync the latest
+// groups/admin state from WhatsApp servers (helps when the bot was made admin
+// in a new group but doesn't see it yet).
+export async function refreshWhatsAppSession(
+  userId: string,
+  onConnected: () => void,
+  onError: (reason: string) => void
+): Promise<void> {
+  const existing = sessions.get(userId);
+  if (!existing) {
+    onError("No active session found. Please connect WhatsApp first.");
+    return;
+  }
+  if (existing.connectLock) {
+    onError("Another connect/refresh is already in progress. Please wait.");
+    return;
+  }
+
+  const { state } = await useMongoDBAuthState(userId);
+  if (!state.creds.registered) {
+    onError("Saved credentials are missing — please use Connect WhatsApp instead.");
+    return;
+  }
+
+  // Close current socket but keep the in-memory session shell so other callers
+  // see "connecting" state during the refresh.
+  if (existing.socket) {
+    closeSocketSafe(existing.socket);
+    existing.socket = null;
+  }
+  existing.connected = false;
+  existing.connecting = true;
+  existing.connectLock = true;
+  existing.retryCount = 0;
+  existing.wasConnected = false;
+
+  const phoneNumber = existing.phoneNumber || "";
+
+  try {
+    await createSocket(
+      userId,
+      phoneNumber,
+      "code",
+      () => {}, // no pairing code expected for already-registered session
+      () => {}, // no QR
+      () => {
+        try { onConnected(); } catch {}
+      },
+      (reason) => {
+        try { onError(reason); } catch {}
+      },
+      existing,
+    );
+  } catch (err: any) {
+    onError(err?.message || "Refresh failed");
+  } finally {
+    existing.connectLock = false;
+  }
+}
+
 export async function disconnectWhatsApp(userId: string): Promise<void> {
   const session = sessions.get(userId);
   if (session) {
