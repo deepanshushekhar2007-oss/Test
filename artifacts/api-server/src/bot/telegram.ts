@@ -616,8 +616,9 @@ function pendingSumExpression(items: Array<{ pendingCount: number }>): string {
 }
 
 function pendingCopyText(title: string, items: Array<{ groupName: string; pendingCount: number }>): string {
-  // Sort A-Z by group name
-  const sorted = [...items].sort((a, b) => a.groupName.localeCompare(b.groupName));
+  // Natural numeric sort so "SK 1, 2, 3, ... 14, 15" comes in correct order
+  // (instead of plain alphabetic which gives "SK 1, 10, 11, 12, 14, 2, 20, 3...")
+  const sorted = [...items].sort((a, b) => a.groupName.localeCompare(b.groupName, undefined, { numeric: true, sensitivity: "base" }));
   let text = `📋 <b>${esc(title)}</b>\n\n<pre>`;
   for (const g of sorted) {
     text += `${g.groupName} ✅ ${g.pendingCount}\n`;
@@ -1168,8 +1169,8 @@ bot.callbackQuery("pending_list", async (ctx) => {
     return;
   }
 
-  // Sort alphabetically by group name (small to large)
-  pendingOnly.sort((a, b) => a.groupName.localeCompare(b.groupName));
+  // Natural numeric sort: SK 1, SK 2, SK 3 ... SK 14, SK 15 (not SK 1, SK 10, SK 11, SK 2)
+  pendingOnly.sort((a, b) => a.groupName.localeCompare(b.groupName, undefined, { numeric: true, sensitivity: "base" }));
 
   // Detect similar patterns from admin group names
   const groupsForPattern = pendingOnly.map((g) => ({ id: g.groupId, subject: g.groupName }));
@@ -5239,10 +5240,11 @@ function autoChatProgressText(session: AutoChatSession): string {
 }
 
 // ── Memory & concurrency tuning for low-RAM hosts (e.g. Render free 512MB) ──
-// These can be tuned via env vars without code changes.
-const MAX_CONCURRENT_AUTOCHAT = Number(process.env.MAX_CONCURRENT_AUTOCHAT || "150");
-const MAX_GROUPS_PER_AUTOCHAT = Number(process.env.MAX_GROUPS_PER_AUTOCHAT || "500");
-const AUTOCHAT_PROGRESS_THROTTLE_MS = Number(process.env.AUTOCHAT_PROGRESS_THROTTLE_MS || "8000");
+// Targeted to handle 200-300 concurrent Auto Chat sessions safely.
+// All limits can be tuned via env vars without code changes.
+const MAX_CONCURRENT_AUTOCHAT = Number(process.env.MAX_CONCURRENT_AUTOCHAT || "300");
+const MAX_GROUPS_PER_AUTOCHAT = Number(process.env.MAX_GROUPS_PER_AUTOCHAT || "300");
+const AUTOCHAT_PROGRESS_THROTTLE_MS = Number(process.env.AUTOCHAT_PROGRESS_THROTTLE_MS || "12000");
 let activeAutoChatCount = 0;
 
 async function runAutoChatBackground(userId: number, autoUserId: string, chatId: number, msgId: number, groups: Array<{ id: string; subject: string }>, message: string, delaySeconds: number, repeatCount: number): Promise<void> {
@@ -5260,10 +5262,14 @@ async function runAutoChatBackground(userId: number, autoUserId: string, chatId:
     return;
   }
 
-  // Safety cap: avoid storing huge group arrays in RAM per user.
-  const cappedGroups = groups.length > MAX_GROUPS_PER_AUTOCHAT
+  // Safety cap + memory trim: keep only group IDs in the long-lived session
+  // (subjects are not read by the send loop or progress text). For 300 users
+  // × 300 groups, this saves ~5–10MB of string heap that would otherwise
+  // sit around for hours during repeat-forever sessions.
+  const slice = groups.length > MAX_GROUPS_PER_AUTOCHAT
     ? groups.slice(0, MAX_GROUPS_PER_AUTOCHAT)
     : groups;
+  const cappedGroups: Array<{ id: string; subject: string }> = slice.map((g) => ({ id: g.id, subject: "" }));
 
   const session: AutoChatSession = {
     running: true,
