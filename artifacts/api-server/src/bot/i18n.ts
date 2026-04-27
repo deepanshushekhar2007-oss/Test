@@ -178,29 +178,43 @@ function restore(text: string, tokens: string[]): string {
 
 // ── Google Translate (free endpoint) ───────────────────────────────────────
 // We use the unofficial free Google Translate endpoints. From cloud IPs (e.g.
-// Render) these can be rate-limited (HTTP 429) or briefly blocked, especially
-// when many strings translate in parallel after a feature opens. To stay
-// reliable we:
-//   1. Send a browser-like User-Agent (a bare Node fetch with no UA gets
-//      blocked aggressively).
-//   2. Bound global concurrency with a semaphore so we never fire more than a
-//      handful of Google calls at the same time.
-//   3. Retry on failure across two distinct endpoints with backoff.
-//   4. Use `dj=1` for a clean JSON response shape (and fall back to the legacy
-//      array form if a particular endpoint ignores it).
+// Render) they sometimes rate-limit (HTTP 429) or briefly block. The design
+// goals here are FAST FAILURE on the cache-miss path so the bot never appears
+// frozen while the i18n layer waits for Google:
+//
+//   1. Browser-like User-Agent — a bare Node fetch with no UA gets blocked.
+//   2. Per-request 2.5s timeout (AbortSignal) so a slow endpoint can't stall.
+//   3. Try 2 distinct endpoints (different host + client tuple) with no
+//      backoff between them; total worst-case 2 × 2.5s = 5s per cache miss.
+//   4. A circuit breaker: if Google fails 3 times in a row, "open" the
+//      circuit for 30s — every subsequent translate() call returns original
+//      text instantly so the bot stays snappy. After the cool-down we probe
+//      Google again automatically.
+//   5. Per-string negative cache: when one specific string fails to
+//      translate we mark it as "skip for 60s" so we don't keep paying the
+//      5s penalty on every render of the same screen.
+//   6. A bounded semaphore caps simultaneous outbound calls so a single
+//      feature open can't fan out 20 parallel requests.
+
 const GT_USER_AGENT =
   "Mozilla/5.0 (Linux; Android 10; SM-G960U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36";
+
+const GT_REQUEST_TIMEOUT_MS = 2500;
+const GT_MAX_CONCURRENCY = 8;
+const GT_CIRCUIT_THRESHOLD = 3;
+const GT_CIRCUIT_OPEN_MS = 30_000;
+const GT_NEG_CACHE_MS = 60_000;
 
 type GtEndpoint = "gtx" | "at";
 
 async function gtTranslateOnce(text: string, gtCode: string, endpoint: GtEndpoint): Promise<string> {
-  // Two separate hostnames/clients — when one rate-limits, the other often
-  // still works because Google enforces quotas per (host, client) tuple.
   const url =
     endpoint === "gtx"
       ? `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(gtCode)}&dt=t&dj=1`
       : `https://translate.google.com/translate_a/single?client=at&sl=auto&tl=${encodeURIComponent(gtCode)}&dt=t&dj=1`;
   const body = `q=${encodeURIComponent(text)}`;
+  // AbortSignal.timeout exists in Node >= 17.3; we know we're on a modern
+  // Node here because the rest of the project uses native fetch.
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -210,6 +224,7 @@ async function gtTranslateOnce(text: string, gtCode: string, endpoint: GtEndpoin
       "Accept-Language": "en-US,en;q=0.9",
     },
     body,
+    signal: AbortSignal.timeout(GT_REQUEST_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`GT ${endpoint} ${res.status}`);
   const data: any = await res.json();
@@ -228,10 +243,7 @@ async function gtTranslateOnce(text: string, gtCode: string, endpoint: GtEndpoin
   return text;
 }
 
-// Tiny semaphore to cap concurrent outbound translation calls. Without this
-// every feature open can fan out 10–20 parallel requests and trip Google's
-// free-tier rate limiter.
-const GT_MAX_CONCURRENCY = 3;
+// ── Concurrency semaphore ────────────────────────────────────────────────
 let gtActive = 0;
 const gtWaitQueue: Array<() => void> = [];
 
@@ -250,31 +262,47 @@ function gtRelease(): void {
   if (next) next();
 }
 
+// ── Circuit breaker ──────────────────────────────────────────────────────
+let gtConsecutiveFailures = 0;
+let gtCircuitOpenUntil = 0;
+
+function gtCircuitIsOpen(): boolean {
+  return Date.now() < gtCircuitOpenUntil;
+}
+
+function gtRecordSuccess(): void {
+  gtConsecutiveFailures = 0;
+  gtCircuitOpenUntil = 0;
+}
+
+function gtRecordFailure(): void {
+  gtConsecutiveFailures++;
+  if (gtConsecutiveFailures >= GT_CIRCUIT_THRESHOLD && !gtCircuitIsOpen()) {
+    gtCircuitOpenUntil = Date.now() + GT_CIRCUIT_OPEN_MS;
+    console.warn(
+      `[i18n] Google Translate circuit OPEN for ${GT_CIRCUIT_OPEN_MS / 1000}s after ${gtConsecutiveFailures} failures`
+    );
+    // Reset the counter so we don't immediately re-open right after the cool-down.
+    gtConsecutiveFailures = 0;
+  }
+}
+
 async function gtTranslate(text: string, gtCode: string): Promise<string> {
-  // 4 attempts across 2 endpoints with mild jittered backoff. Total worst-case
-  // wall time ~2.5s, which is fine since we only get here on cache miss.
-  const ATTEMPTS: GtEndpoint[] = ["gtx", "at", "gtx", "at"];
-  const BACKOFF_MS = [0, 250, 700, 1500];
+  if (gtCircuitIsOpen()) throw new Error("GT circuit open");
+  const ATTEMPTS: GtEndpoint[] = ["gtx", "at"];
   await gtAcquire();
   try {
     let lastErr: any;
     for (let i = 0; i < ATTEMPTS.length; i++) {
-      if (BACKOFF_MS[i] > 0) {
-        const jitter = Math.floor(Math.random() * 150);
-        await new Promise((r) => setTimeout(r, BACKOFF_MS[i] + jitter));
-      }
       try {
-        return await gtTranslateOnce(text, gtCode, ATTEMPTS[i]);
+        const result = await gtTranslateOnce(text, gtCode, ATTEMPTS[i]);
+        gtRecordSuccess();
+        return result;
       } catch (err: any) {
         lastErr = err;
-        // 4xx other than 429 → don't bother retrying with same endpoint
-        const msg = String(err?.message || "");
-        if (/\s4\d\d$/.test(msg) && !/429$/.test(msg)) {
-          // try the other endpoint at most once more
-          continue;
-        }
       }
     }
+    gtRecordFailure();
     throw lastErr ?? new Error("GT all attempts failed");
   } finally {
     gtRelease();
@@ -285,17 +313,31 @@ async function gtTranslate(text: string, gtCode: string): Promise<string> {
 // don't fire 5 parallel HTTP calls.
 const inflight = new Map<string, Promise<string>>();
 
+// Per-string negative cache: when one specific string fails, mark it as
+// "skip for N ms" so re-renders of the same screen don't keep paying the
+// retry cost. Cleared on a successful retranslation.
+const negCacheUntil = new Map<string, number>();
+
 export async function translate(text: string, lang: Language): Promise<string> {
   if (!text || lang === "default") return text;
   const meta = LANGUAGES[lang as Exclude<Language, "default">];
   if (!meta) return text;
   const key = cacheKey(text, lang);
 
-  // L1: in-memory cache
+  // L1: in-memory cache (success cache — translated text)
   const hit = memGet(key);
   if (hit !== undefined) return hit;
 
-  // L2: MongoDB cache
+  // L1b: per-string negative cache. If this exact string failed recently,
+  // skip the network round-trip entirely and return original. Keeps the bot
+  // snappy when one phrase is hard to translate or Google is rate-limiting.
+  const negUntil = negCacheUntil.get(key);
+  if (negUntil) {
+    if (Date.now() < negUntil) return text;
+    negCacheUntil.delete(key);
+  }
+
+  // L2: MongoDB cache (survives restarts)
   const dbHit = await dbGet(key);
   if (dbHit !== undefined) {
     memSet(key, dbHit);
@@ -316,7 +358,15 @@ export async function translate(text: string, lang: Language): Promise<string> {
       void dbSet(key, lang, text, restored);
       return restored;
     } catch (err: any) {
-      console.error(`[i18n] translate(${lang}) failed:`, err?.message);
+      // Negatively cache this string so subsequent renders of the same
+      // screen don't keep paying the Google round-trip cost.
+      negCacheUntil.set(key, Date.now() + GT_NEG_CACHE_MS);
+      // Only log non-circuit-open failures — circuit-open is expected and
+      // would otherwise spam the log every render while the breaker is open.
+      const msg = String(err?.message || "");
+      if (!msg.includes("circuit open")) {
+        console.error(`[i18n] translate(${lang}) failed:`, msg);
+      }
       return text; // graceful fallback to original
     } finally {
       inflight.delete(key);
