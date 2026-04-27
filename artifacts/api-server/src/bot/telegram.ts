@@ -666,14 +666,21 @@ interface QrPairingState {
 
 const qrPairings: Map<number, QrPairingState> = new Map();
 
+// Cleanup interval (15 min) — keeps RAM footprint tight on low-memory hosts
+// (Render free 512MB) when 500-1000 concurrent users are connected.
+const MEMORY_CLEANUP_INTERVAL_MS = Number(process.env.MEMORY_CLEANUP_INTERVAL_MS || String(15 * 60 * 1000));
 setInterval(() => {
   const activeUserIds = new Set([
     ...autoChatSessions.keys(),
     ...cigSessions.keys(),
     ...acfSessions.keys(),
   ]);
-  for (const [userId] of userStates) {
+  for (const [userId, state] of userStates) {
     if (!activeUserIds.has(userId)) {
+      // Eagerly drop any large Buffers (group DPs / edit-settings DPs) so
+      // they become GC-able immediately, not at the next heap pressure.
+      if (state.groupSettings) state.groupSettings.dpBuffers = [];
+      if (state.editSettingsData) state.editSettingsData.settings.dpBuffers = [];
       userStates.delete(userId);
     }
   }
@@ -690,10 +697,65 @@ setInterval(() => {
   if (typeof (global as any).gc === "function") {
     (global as any).gc();
   }
+  const mem = process.memoryUsage();
+  const rssMb = Math.round(mem.rss / 1024 / 1024);
+  const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
   console.log(
-    `[MEMORY] Cleanup: userStates=${userStates.size} autoChat=${autoChatSessions.size} cig=${cigSessions.size} acf=${acfSessions.size} qr=${qrPairings.size}`
+    `[MEMORY] Cleanup: rss=${rssMb}MB heap=${heapMb}MB userStates=${userStates.size} autoChat=${autoChatSessions.size} cig=${cigSessions.size} acf=${acfSessions.size} qr=${qrPairings.size}`
   );
-}, 20 * 60 * 1000);
+}, MEMORY_CLEANUP_INTERVAL_MS);
+
+// ── High-memory alert: ping admin on Telegram when RSS crosses threshold ──
+// Checks every 1 min. Sends alert when RSS >= MEMORY_ALERT_THRESHOLD_PCT of
+// MEMORY_ALERT_LIMIT_MB. Cooldown prevents spam — once alerted, won't alert
+// again until either RAM drops below threshold OR cooldown expires.
+const MEMORY_ALERT_LIMIT_MB = Number(process.env.MEMORY_ALERT_LIMIT_MB || "512");
+const MEMORY_ALERT_THRESHOLD_PCT = Number(process.env.MEMORY_ALERT_THRESHOLD_PCT || "85");
+const MEMORY_ALERT_COOLDOWN_MS = Number(process.env.MEMORY_ALERT_COOLDOWN_MS || String(30 * 60 * 1000));
+let memoryAlertLastSentAt = 0;
+let memoryAlertActive = false;
+setInterval(() => {
+  try {
+    const mem = process.memoryUsage();
+    const rssMb = mem.rss / 1024 / 1024;
+    const heapUsedMb = mem.heapUsed / 1024 / 1024;
+    const heapTotalMb = mem.heapTotal / 1024 / 1024;
+    const rssPct = (rssMb / MEMORY_ALERT_LIMIT_MB) * 100;
+    const now = Date.now();
+
+    if (rssPct >= MEMORY_ALERT_THRESHOLD_PCT) {
+      const cooldownOver = now - memoryAlertLastSentAt >= MEMORY_ALERT_COOLDOWN_MS;
+      // Send only on the first crossing OR after cooldown — avoids spamming
+      // the admin every minute while RAM stays high.
+      if (!memoryAlertActive || cooldownOver) {
+        memoryAlertActive = true;
+        memoryAlertLastSentAt = now;
+        const text =
+          `⚠️ <b>High RAM Alert</b>\n\n` +
+          `📦 RSS: <b>${rssMb.toFixed(1)} MB</b> / ${MEMORY_ALERT_LIMIT_MB} MB ` +
+          `(<b>${rssPct.toFixed(0)}%</b>)\n` +
+          `🔵 Heap: ${heapUsedMb.toFixed(1)} MB / ${heapTotalMb.toFixed(1)} MB\n\n` +
+          `👥 Active Sessions:\n` +
+          `  📱 WhatsApp: ${getActiveSessionUserIds().size}\n` +
+          `  🤖 Auto Chat: ${autoChatSessions.size} / ${MAX_CONCURRENT_AUTOCHAT}\n` +
+          `  💬 Chat-In-Group: ${cigSessions.size}\n` +
+          `  🔁 Auto Chat Friend: ${acfSessions.size}\n\n` +
+          `💡 Use /memory for full details.`;
+        bot.api.sendMessage(ADMIN_USER_ID, text, { parse_mode: "HTML" }).catch((err) => {
+          console.error(`[MEMORY_ALERT] Failed to notify admin:`, err?.message);
+        });
+        console.log(`[MEMORY_ALERT] Triggered: rss=${rssMb.toFixed(1)}MB (${rssPct.toFixed(0)}%)`);
+      }
+    } else if (memoryAlertActive && rssPct < MEMORY_ALERT_THRESHOLD_PCT - 5) {
+      // Reset only after RAM drops at least 5% below threshold (hysteresis) so
+      // we don't flap if RSS hovers right at the boundary.
+      memoryAlertActive = false;
+      console.log(`[MEMORY_ALERT] Cleared: rss=${rssMb.toFixed(1)}MB (${rssPct.toFixed(0)}%)`);
+    }
+  } catch (err: any) {
+    console.error(`[MEMORY_ALERT] check error:`, err?.message);
+  }
+}, 60 * 1000);
 
 function qrActiveKeyboard(): InlineKeyboard {
   return new InlineKeyboard().text("❌ Cancel", "connect_pair_qr_cancel").text("🔙 Back", "connect_wa");
@@ -1695,21 +1757,42 @@ bot.command("memory", async (ctx) => {
   const heapUsed = parseFloat(toMB(mem.heapUsed));
   const heapTotal = parseFloat(toMB(mem.heapTotal));
   const rss = parseFloat(toMB(mem.rss));
+  const external = parseFloat(toMB(mem.external));
   const heapPct = Math.round((heapUsed / heapTotal) * 100);
 
-  const heapBar = buildMemBar(heapPct);
-  const heapStatus = heapPct >= 85 ? "🔴 Critical" : heapPct >= 65 ? "🟡 High" : "🟢 Normal";
+  // Render free tier = 512 MB total. We compute against that so the bar shows
+  // real "how close are we to OOM" pressure, not just heap-vs-heap.
+  const RENDER_LIMIT_MB = Number(process.env.RENDER_RAM_LIMIT_MB || "512");
+  const rssPct = Math.min(100, Math.round((rss / RENDER_LIMIT_MB) * 100));
 
-  const activeIds = getActiveSessionUserIds();
+  const heapBar = buildMemBar(heapPct);
+  const rssBar = buildMemBar(rssPct);
+  const heapStatus = heapPct >= 85 ? "🔴 Critical" : heapPct >= 65 ? "🟡 High" : "🟢 Normal";
+  const rssStatus = rssPct >= 85 ? "🔴 Critical" : rssPct >= 65 ? "🟡 High" : "🟢 Normal";
+
+  const waActiveIds = getActiveSessionUserIds();
+  const uptimeMin = Math.floor(process.uptime() / 60);
+  const uptimeStr = uptimeMin >= 60
+    ? `${Math.floor(uptimeMin / 60)}h ${uptimeMin % 60}m`
+    : `${uptimeMin}m`;
 
   const text =
-    `🧠 <b>Server Memory Usage</b>\n\n` +
-    `📦 <b>RAM (RSS):</b> ${rss} MB\n` +
-    `🔵 <b>Heap Used:</b> ${heapUsed} MB / ${heapTotal} MB\n` +
-    `📊 <b>Heap %:</b> ${heapBar} ${heapPct}%\n` +
-    `🔋 <b>Status:</b> ${heapStatus}\n\n` +
-    `📱 <b>Active WA Sessions:</b> ${activeIds.size}\n` +
-    `💡 Limit: 400 MB (--max-old-space-size)`;
+    `🧠 <b>Server Live Stats</b>\n\n` +
+    `📦 <b>RAM (RSS):</b> ${rss} MB / ${RENDER_LIMIT_MB} MB\n` +
+    `${rssBar} ${rssPct}%  ${rssStatus}\n\n` +
+    `🔵 <b>Heap:</b> ${heapUsed} MB / ${heapTotal} MB\n` +
+    `${heapBar} ${heapPct}%  ${heapStatus}\n` +
+    `🧩 <b>External:</b> ${external} MB\n\n` +
+    `👥 <b>Active Sessions:</b>\n` +
+    `  📱 WhatsApp connected: <b>${waActiveIds.size}</b>\n` +
+    `  🤖 Auto Chat running: <b>${autoChatSessions.size}</b> / ${MAX_CONCURRENT_AUTOCHAT}\n` +
+    `  💬 Chat-In-Group running: <b>${cigSessions.size}</b>\n` +
+    `  🔁 Auto Chat Friend running: <b>${acfSessions.size}</b>\n` +
+    `  🗂️ User states in memory: <b>${userStates.size}</b>\n` +
+    `  📷 QR pairings active: <b>${qrPairings.size}</b>\n\n` +
+    `⏱️ <b>Uptime:</b> ${uptimeStr}\n` +
+    `💡 Heap limit: 460 MB (--max-old-space-size)\n` +
+    `🧹 Cleanup: every ${Math.round(MEMORY_CLEANUP_INTERVAL_MS / 60000)} min`;
 
   await ctx.reply(text, { parse_mode: "HTML" });
 });
@@ -1939,11 +2022,12 @@ for (const [cb, dur] of [["gdm_24h", 86400], ["gdm_7d", 604800], ["gdm_90d", 777
     if (!state?.groupSettings) return;
     state.groupSettings.disappearingMessages = dur;
     state.step = "group_dp";
+    const maxDps = state.groupSettings.count;
     await ctx.editMessageText(
       "🖼️ <b>Group Profile Photo(s)</b>\n\n" +
-      "Ek ya zyada photos bhejo (max 50).\n\n" +
+      `Ek ya zyada photos bhejo (max ${maxDps}).\n\n` +
       "• 1 photo bhejoge → sab groups mein wahi DP lagega\n" +
-      "• N photos bhejoge → 1st DP → 1st group, 2nd DP → 2nd group, ... agar groups zyada hain to DPs rotate honge\n\n" +
+      `• N photos bhejoge → 1st DP → 1st group, 2nd DP → 2nd group, ... (max ${maxDps} kyunki tum ${maxDps} group bana rahe ho)\n\n` +
       "Photos ek ek karke bhejo. Saare bhej do to <b>✅ Done</b> dabao.\n" +
       "DP nahi lagana to <b>⏭️ Skip</b> karo.",
       { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("⏭️ Skip", "group_dp_skip").text("❌ Cancel", "main_menu") }
@@ -2173,6 +2257,12 @@ async function createGroupsBackground(userId: string, numericUserId: number, gs:
           const dpBuf = gs.dpBuffers[i % gs.dpBuffers.length];
           await new Promise((r) => setTimeout(r, 2000));
           await setGroupIcon(userId, result.id, dpBuf);
+          // Memory: when each DP is one-shot (i.e. dpBuffers.length >= total
+          // groups, so no rotation), free that buffer right after use so the
+          // heap doesn't carry hundreds of KB per user across the entire loop.
+          if (gs.dpBuffers.length >= total) {
+            gs.dpBuffers[i] = Buffer.alloc(0);
+          }
         }
 
         let finalFriendsAdded = 0;
@@ -2225,6 +2315,11 @@ async function createGroupsBackground(userId: string, numericUserId: number, gs:
 
     if (i < total - 1) await new Promise((r) => setTimeout(r, 4000));
   }
+
+  // Memory: drop all DP buffers as soon as the whole creation flow is done.
+  // userStates.delete() below will eventually GC the state, but explicit clear
+  // here lets the buffers be freed before any further async work in this fn.
+  gs.dpBuffers = [];
 
   userStates.delete(numericUserId);
 
@@ -5240,11 +5335,11 @@ function autoChatProgressText(session: AutoChatSession): string {
 }
 
 // ── Memory & concurrency tuning for low-RAM hosts (e.g. Render free 512MB) ──
-// Targeted to handle 200-300 concurrent Auto Chat sessions safely.
+// Targeted to handle 500-1000 concurrent Auto Chat sessions safely.
 // All limits can be tuned via env vars without code changes.
-const MAX_CONCURRENT_AUTOCHAT = Number(process.env.MAX_CONCURRENT_AUTOCHAT || "300");
+const MAX_CONCURRENT_AUTOCHAT = Number(process.env.MAX_CONCURRENT_AUTOCHAT || "1000");
 const MAX_GROUPS_PER_AUTOCHAT = Number(process.env.MAX_GROUPS_PER_AUTOCHAT || "300");
-const AUTOCHAT_PROGRESS_THROTTLE_MS = Number(process.env.AUTOCHAT_PROGRESS_THROTTLE_MS || "12000");
+const AUTOCHAT_PROGRESS_THROTTLE_MS = Number(process.env.AUTOCHAT_PROGRESS_THROTTLE_MS || "20000");
 let activeAutoChatCount = 0;
 
 async function runAutoChatBackground(userId: number, autoUserId: string, chatId: number, msgId: number, groups: Array<{ id: string; subject: string }>, message: string, delaySeconds: number, repeatCount: number): Promise<void> {
@@ -7392,8 +7487,9 @@ bot.on("message:photo", async (ctx) => {
 
   if (state.step === "group_dp" && state.groupSettings) {
     try {
-      if (state.groupSettings.dpBuffers.length >= 50) {
-        await ctx.reply("⚠️ <b>Max 50 DPs reached.</b> Done dabake aage badho.", {
+      const maxDps = state.groupSettings.count;
+      if (state.groupSettings.dpBuffers.length >= maxDps) {
+        await ctx.reply(`⚠️ <b>Max ${maxDps} DP${maxDps === 1 ? "" : "s"} reached.</b> Tum ${maxDps} group bana rahe ho, isliye max ${maxDps} DP. Done dabake aage badho.`, {
           parse_mode: "HTML",
           reply_markup: new InlineKeyboard().text("✅ Done", "group_dp_done").text("❌ Cancel", "main_menu"),
         });
@@ -7407,8 +7503,8 @@ bot.on("message:photo", async (ctx) => {
       const count = state.groupSettings.dpBuffers.length;
       await ctx.reply(
         `✅ <b>DP ${count} saved!</b>\n\n` +
-        `Aur photos bhej sakte ho (max 50), ya <b>✅ Done</b> dabake aage badho.\n` +
-        `Total ab tak: <b>${count}</b>`,
+        `Aur photos bhej sakte ho (max ${maxDps}), ya <b>✅ Done</b> dabake aage badho.\n` +
+        `Total ab tak: <b>${count}/${maxDps}</b>`,
         {
           parse_mode: "HTML",
           reply_markup: new InlineKeyboard().text("✅ Done", "group_dp_done").text("❌ Cancel", "main_menu"),
