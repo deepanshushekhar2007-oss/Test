@@ -41,6 +41,7 @@ import { parseVCF, normalizePhone } from "./vcf-parser";
 import QRCode from "qrcode";
 import https from "https";
 import http from "http";
+import { AsyncLocalStorage } from "async_hooks";
 import {
   loadBotData,
   saveBotData,
@@ -77,16 +78,52 @@ const bot = new Bot(token || "placeholder");
 // i18n API transformer: auto-translate every outgoing message + button label
 // based on the destination user's language preference. Single chokepoint so
 // no individual call site needs to change.
+//
+// Coverage:
+//   • sendMessage / sendPhoto / sendDocument / sendVideo / sendAnimation
+//     → translates `text` and `caption` body, plus inline keyboard buttons.
+//   • editMessageText / editMessageCaption / editMessageMedia
+//     → same as above, including caption inside `media`.
+//   • editMessageReplyMarkup → translates inline keyboard button labels even
+//     when only the markup changes (no text edit).
+//   • answerCallbackQuery → translates the alert/toast `text` field.
+//
+// Language resolution priority (to support every grammy call style):
+//   1. payload.chat_id when it is a number (or a numeric string).
+//   2. AsyncLocalStorage user-id captured by the per-update middleware below.
+//      This is what lets answerCallbackQuery (which has no chat_id) and any
+//      other non-chat-bound method still pick up the right user language.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Per-update store of the active user's Telegram ID. Set by `bot.use` below,
+// read by the api transformer when no chat_id is available on the payload.
+const updateUserCtx = new AsyncLocalStorage<number>();
+
 const TRANSLATABLE_METHODS = new Set([
   "sendMessage",
   "editMessageText",
   "editMessageCaption",
+  "editMessageMedia",
+  "editMessageReplyMarkup",
   "sendPhoto",
   "sendDocument",
   "sendVideo",
   "sendAnimation",
+  "answerCallbackQuery",
 ]);
+
+function resolveLangFromPayload(payload: any): Language {
+  const chatId = payload?.chat_id;
+  if (typeof chatId === "number") return getUserLang(chatId);
+  if (typeof chatId === "string") {
+    const n = Number(chatId);
+    if (Number.isFinite(n)) return getUserLang(n);
+  }
+  // Fallback: use the user-id captured by the per-update middleware.
+  const uid = updateUserCtx.getStore();
+  if (typeof uid === "number") return getUserLang(uid);
+  return "default";
+}
 
 bot.api.config.use(async (prev, method, payload, signal) => {
   try {
@@ -99,8 +136,7 @@ bot.api.config.use(async (prev, method, payload, signal) => {
       return prev(method, payload, signal);
     }
 
-    const chatId = (payload as any).chat_id;
-    const lang: Language = typeof chatId === "number" ? getUserLang(chatId) : "default";
+    const lang: Language = resolveLangFromPayload(payload);
 
     // Fast path: default language → no translation overhead at all.
     if (lang === "default") {
@@ -119,6 +155,7 @@ bot.api.config.use(async (prev, method, payload, signal) => {
     const newPayload: any = { ...payload };
 
     // Translate text body (unless explicitly marked no-translate).
+    // `text` covers sendMessage / editMessageText / answerCallbackQuery alerts.
     if (typeof newPayload.text === "string") {
       if (isNotr(newPayload.text)) {
         newPayload.text = stripNotr(newPayload.text);
@@ -126,6 +163,8 @@ bot.api.config.use(async (prev, method, payload, signal) => {
         newPayload.text = await translate(newPayload.text, lang);
       }
     }
+    // `caption` covers sendPhoto / sendDocument / sendVideo / sendAnimation /
+    // editMessageCaption.
     if (typeof newPayload.caption === "string") {
       if (isNotr(newPayload.caption)) {
         newPayload.caption = stripNotr(newPayload.caption);
@@ -133,7 +172,16 @@ bot.api.config.use(async (prev, method, payload, signal) => {
         newPayload.caption = await translate(newPayload.caption, lang);
       }
     }
-    // Translate inline keyboard button labels.
+    // editMessageMedia carries caption inside the `media` object.
+    if (newPayload.media && typeof newPayload.media.caption === "string") {
+      if (isNotr(newPayload.media.caption)) {
+        newPayload.media = { ...newPayload.media, caption: stripNotr(newPayload.media.caption) };
+      } else {
+        newPayload.media = { ...newPayload.media, caption: await translate(newPayload.media.caption, lang) };
+      }
+    }
+    // Translate inline keyboard button labels (works for both edit-text and
+    // edit-only-reply-markup paths).
     if (newPayload.reply_markup && Array.isArray(newPayload.reply_markup.inline_keyboard)) {
       newPayload.reply_markup = await translateInlineKeyboard(newPayload.reply_markup, lang);
     }
@@ -142,6 +190,19 @@ bot.api.config.use(async (prev, method, payload, signal) => {
   } catch (err: any) {
     console.error(`[i18n] transformer error on ${method}:`, err?.message);
     return prev(method, payload, signal);
+  }
+});
+
+// Run every incoming update inside an AsyncLocalStorage scope tagged with the
+// triggering user's ID. This lets the API transformer above resolve the right
+// language even for methods that carry no chat_id (e.g. answerCallbackQuery)
+// and for places that send messages indirectly (timers, post-await flows).
+bot.use(async (ctx, next) => {
+  const userId = ctx.from?.id;
+  if (typeof userId === "number") {
+    await updateUserCtx.run(userId, next);
+  } else {
+    await next();
   }
 });
 
