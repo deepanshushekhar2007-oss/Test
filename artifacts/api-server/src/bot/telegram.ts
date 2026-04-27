@@ -49,6 +49,20 @@ import {
   hasUserAccess,
 } from "./mongo-bot-data";
 import { getSessionStats, cleanupStaleSessions, clearMongoSession } from "./mongo-auth-state";
+import {
+  Language,
+  LANGUAGES,
+  getUserLang,
+  hasUserLang,
+  setUserLanguage,
+  loadUserLanguages,
+  translate,
+  translateInlineKeyboard,
+  warmUpLanguage,
+  notr,
+  isNotr,
+  stripNotr,
+} from "./i18n";
 
 const token = process.env["TELEGRAM_BOT_TOKEN"] || "";
 
@@ -58,6 +72,78 @@ const OWNER_USERNAME = "@SPIDYWS";
 const BOT_DISPLAY_NAME = "ᴡꜱ ᴀᴜᴛᴏᴍᴀᴛɪᴏɴ";
 
 const bot = new Bot(token || "placeholder");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// i18n API transformer: auto-translate every outgoing message + button label
+// based on the destination user's language preference. Single chokepoint so
+// no individual call site needs to change.
+// ─────────────────────────────────────────────────────────────────────────────
+const TRANSLATABLE_METHODS = new Set([
+  "sendMessage",
+  "editMessageText",
+  "editMessageCaption",
+  "sendPhoto",
+  "sendDocument",
+  "sendVideo",
+  "sendAnimation",
+]);
+
+bot.api.config.use(async (prev, method, payload, signal) => {
+  try {
+    if (!TRANSLATABLE_METHODS.has(method)) {
+      // Still strip the no-translate marker if present, even when we don't translate.
+      if (payload && typeof (payload as any).text === "string" && isNotr((payload as any).text)) {
+        const newPayload: any = { ...payload, text: stripNotr((payload as any).text) };
+        return prev(method, newPayload, signal);
+      }
+      return prev(method, payload, signal);
+    }
+
+    const chatId = (payload as any).chat_id;
+    const lang: Language = typeof chatId === "number" ? getUserLang(chatId) : "default";
+
+    // Fast path: default language → no translation overhead at all.
+    if (lang === "default") {
+      // Even on default, strip the no-translate marker so it never reaches Telegram.
+      const text = (payload as any).text;
+      const caption = (payload as any).caption;
+      if ((typeof text === "string" && isNotr(text)) || (typeof caption === "string" && isNotr(caption))) {
+        const newPayload: any = { ...payload };
+        if (typeof text === "string" && isNotr(text)) newPayload.text = stripNotr(text);
+        if (typeof caption === "string" && isNotr(caption)) newPayload.caption = stripNotr(caption);
+        return prev(method, newPayload, signal);
+      }
+      return prev(method, payload, signal);
+    }
+
+    const newPayload: any = { ...payload };
+
+    // Translate text body (unless explicitly marked no-translate).
+    if (typeof newPayload.text === "string") {
+      if (isNotr(newPayload.text)) {
+        newPayload.text = stripNotr(newPayload.text);
+      } else {
+        newPayload.text = await translate(newPayload.text, lang);
+      }
+    }
+    if (typeof newPayload.caption === "string") {
+      if (isNotr(newPayload.caption)) {
+        newPayload.caption = stripNotr(newPayload.caption);
+      } else {
+        newPayload.caption = await translate(newPayload.caption, lang);
+      }
+    }
+    // Translate inline keyboard button labels.
+    if (newPayload.reply_markup && Array.isArray(newPayload.reply_markup.inline_keyboard)) {
+      newPayload.reply_markup = await translateInlineKeyboard(newPayload.reply_markup, lang);
+    }
+
+    return prev(method, newPayload, signal);
+  } catch (err: any) {
+    console.error(`[i18n] transformer error on ${method}:`, err?.message);
+    return prev(method, payload, signal);
+  }
+});
 
 type TelegramButtonStyle = "primary" | "success" | "danger";
 
@@ -965,11 +1051,137 @@ bot.command("start", async (ctx) => {
     return;
   }
   userStates.delete(userId);
+  // First-time users (no language set yet) → language picker first.
+  if (!hasUserLang(userId)) {
+    await sendLanguagePicker(ctx, true);
+    return;
+  }
   await ctx.reply(
     mainMenuText(userId, "welcome"),
     { parse_mode: "HTML", reply_markup: mainMenu(userId) }
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// /language command — pick UI language. Shows 5 options:
+//   1. Default (current Hindi+English mix, no translation)
+//   2. English
+//   3. हिन्दी (Hindi)
+//   4. Bahasa Indonesia
+//   5. 中文 (Chinese)
+// The picker UI itself is wrapped in notr() so its text/buttons are never
+// translated — language names should always show in their native scripts.
+// ─────────────────────────────────────────────────────────────────────────────
+function languagePickerKeyboard(): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text(notr("🌐 Default (Hindi + English)"), "lang_set_default").row();
+  kb.text(notr(`${LANGUAGES.en.flag} ${LANGUAGES.en.nativeName}`), "lang_set_en").row();
+  kb.text(notr(`${LANGUAGES.hi.flag} ${LANGUAGES.hi.nativeName}`), "lang_set_hi").row();
+  kb.text(notr(`${LANGUAGES.id.flag} ${LANGUAGES.id.nativeName}`), "lang_set_id").row();
+  kb.text(notr(`${LANGUAGES.zh.flag} ${LANGUAGES.zh.nativeName}`), "lang_set_zh").row();
+  return kb;
+}
+
+async function sendLanguagePicker(ctx: any, isFirstRun: boolean): Promise<void> {
+  const heading = isFirstRun
+    ? "👋 <b>Welcome!</b>\n\n🌐 <b>Choose your language</b> / भाषा चुनें / Pilih bahasa / 选择语言"
+    : "🌐 <b>Choose your language</b> / भाषा चुनें / Pilih bahasa / 选择语言";
+  const body =
+    `${heading}\n\n` +
+    `• <b>Default</b> — Hindi + English (current)\n` +
+    `• <b>English</b> — full English UI\n` +
+    `• <b>हिन्दी</b> — pure Hindi UI\n` +
+    `• <b>Bahasa Indonesia</b> — Indonesian UI\n` +
+    `• <b>中文</b> — Chinese UI\n\n` +
+    `<i>Tip: you can change this anytime with /language</i>`;
+  await ctx.reply(notr(body), {
+    parse_mode: "HTML",
+    reply_markup: languagePickerKeyboard(),
+  });
+}
+
+bot.command("language", async (ctx) => {
+  const userId = ctx.from!.id;
+  await trackUser(userId);
+  if (await isBanned(userId)) return;
+  await sendLanguagePicker(ctx, false);
+});
+
+async function applyLanguageSelection(ctx: any, lang: Language): Promise<void> {
+  const userId = ctx.from.id;
+  await ctx.answerCallbackQuery();
+
+  // Persist the choice immediately so all subsequent messages use it.
+  await setUserLanguage(userId, lang);
+
+  // For "default" there's nothing to warm up — go straight to the menu.
+  if (lang === "default") {
+    try {
+      await ctx.editMessageText(
+        notr("✅ <b>Language set:</b> Default (Hindi + English)\n\nLoading menu..."),
+        { parse_mode: "HTML" }
+      );
+    } catch {}
+    await new Promise((r) => setTimeout(r, 300));
+    try {
+      await ctx.editMessageText(
+        mainMenuText(userId, "welcome"),
+        { parse_mode: "HTML", reply_markup: mainMenu(userId) }
+      );
+    } catch {
+      await ctx.reply(mainMenuText(userId, "welcome"), {
+        parse_mode: "HTML", reply_markup: mainMenu(userId),
+      });
+    }
+    return;
+  }
+
+  // For non-default langs: show progress bar while we warm up the cache.
+  const meta = LANGUAGES[lang as Exclude<Language, "default">];
+  const renderBar = (done: number, total: number): string => {
+    const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+    const filled = Math.floor(pct / 5);
+    const bar = "█".repeat(filled) + "░".repeat(20 - filled);
+    return (
+      `${meta.flag} <b>Switching to ${meta.nativeName}...</b>\n\n` +
+      `<code>[${bar}] ${pct}%</code>\n` +
+      `${done}/${total} translated`
+    );
+  };
+
+  let lastEditAt = 0;
+  try {
+    await ctx.editMessageText(notr(renderBar(0, 1)), { parse_mode: "HTML" });
+  } catch {}
+
+  await warmUpLanguage(lang, async (done, total) => {
+    // Throttle Telegram edits to avoid 429s; update every ~700ms or on completion.
+    const now = Date.now();
+    if (now - lastEditAt < 700 && done < total) return;
+    lastEditAt = now;
+    try {
+      await ctx.editMessageText(notr(renderBar(done, total)), { parse_mode: "HTML" });
+    } catch {}
+  });
+
+  // Done — show the main menu in the new language. The transformer auto-translates.
+  try {
+    await ctx.editMessageText(
+      mainMenuText(userId, "welcome"),
+      { parse_mode: "HTML", reply_markup: mainMenu(userId) }
+    );
+  } catch {
+    await ctx.reply(mainMenuText(userId, "welcome"), {
+      parse_mode: "HTML", reply_markup: mainMenu(userId),
+    });
+  }
+}
+
+bot.callbackQuery("lang_set_default", (ctx) => applyLanguageSelection(ctx, "default"));
+bot.callbackQuery("lang_set_en", (ctx) => applyLanguageSelection(ctx, "en"));
+bot.callbackQuery("lang_set_hi", (ctx) => applyLanguageSelection(ctx, "hi"));
+bot.callbackQuery("lang_set_id", (ctx) => applyLanguageSelection(ctx, "id"));
+bot.callbackQuery("lang_set_zh", (ctx) => applyLanguageSelection(ctx, "zh"));
 
 bot.command("help", async (ctx) => {
   const userId = ctx.from!.id;
@@ -7752,7 +7964,7 @@ function splitMessage(msg: string, maxLen: number): string[] {
   return parts;
 }
 
-export function startBot() {
+export async function startBot() {
   if (!token) {
     console.log("[BOT] TELEGRAM_BOT_TOKEN not set — bot disabled. Set it to enable the Telegram bot.");
     return;
@@ -7846,6 +8058,14 @@ export function startBot() {
     try { await bot.stop(); } catch {}
     process.exit(0);
   });
+
+  // Hydrate per-user language preferences from MongoDB before polling starts,
+  // so the very first outgoing message uses the right language.
+  try {
+    await loadUserLanguages();
+  } catch (err: any) {
+    console.error("[i18n] loadUserLanguages failed:", err?.message);
+  }
 
   launchBot();
 }
