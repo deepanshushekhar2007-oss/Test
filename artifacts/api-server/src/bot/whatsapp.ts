@@ -1151,9 +1151,15 @@ function isFatalInviteError(err: any): boolean {
   return FATAL_INVITE_ERRORS.some((e) => msg.includes(e));
 }
 
-export async function getGroupInviteLink(userId: string, groupId: string, maxRetries: number = 3): Promise<string | null> {
+export async function getGroupInviteLink(userId: string, groupId: string, maxRetries: number = 5): Promise<string | null> {
   const session = sessions.get(userId);
   if (!session?.socket || !session.connected) return null;
+
+  // Exponential backoff: 1.5s, 3s, 5s, 8s, 12s. Total worst-case ~30s for 5
+  // attempts. This is much more forgiving than the old fixed 1.5s × 3 (which
+  // gave up after ~5s and silently dropped 2-3 groups out of every 10 when WA
+  // throttled or stream-replied late).
+  const backoffSchedule = [1500, 3000, 5000, 8000, 12000];
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -1164,19 +1170,24 @@ export async function getGroupInviteLink(userId: string, groupId: string, maxRet
       if (isFatalInviteError(err)) return null;
     }
 
-    try {
-      const meta = await session.socket!.groupMetadata(groupId);
-      if (meta && (meta as any).inviteCode) {
-        return `https://chat.whatsapp.com/${(meta as any).inviteCode}`;
+    // Metadata fallback only on later attempts — it's expensive (full fetch)
+    // and on the first try we want to be fast. By attempt 3 we want every
+    // possible recovery path active.
+    if (attempt >= 3) {
+      try {
+        const meta = await session.socket!.groupMetadata(groupId);
+        if (meta && (meta as any).inviteCode) {
+          return `https://chat.whatsapp.com/${(meta as any).inviteCode}`;
+        }
+      } catch (err2: any) {
+        console.error(`[WA][${userId}] groupMetadata fallback error for ${groupId} (attempt ${attempt}/${maxRetries}):`, err2?.message ?? err2?.data);
+        if (isFatalInviteError(err2)) return null;
       }
-    } catch (err2: any) {
-      console.error(`[WA][${userId}] groupMetadata fallback error for ${groupId} (attempt ${attempt}/${maxRetries}):`, err2?.message ?? err2?.data);
-      if (isFatalInviteError(err2)) return null;
     }
 
     if (attempt < maxRetries) {
-      const delay = 1500;
-      console.log(`[WA][${userId}] Retrying getGroupInviteLink for ${groupId} in ${delay}ms...`);
+      const delay = backoffSchedule[Math.min(attempt - 1, backoffSchedule.length - 1)];
+      console.log(`[WA][${userId}] Retrying getGroupInviteLink for ${groupId} in ${delay}ms (attempt ${attempt + 1}/${maxRetries})...`);
       await new Promise((r) => setTimeout(r, delay));
       if (!session.socket || !session.connected) return null;
     }

@@ -2784,7 +2784,14 @@ bot.callbackQuery("gl_cancel_confirm", async (ctx) => {
 });
 
 const GL_BATCH_SIZE = 1;
-const GL_BATCH_DELAY_MS = 600;
+const GL_BATCH_DELAY_MS = 800;
+// After a fetch failure, wait a little longer before the next group so we
+// don't pile up calls during a WhatsApp throttle window.
+const GL_AFTER_FAIL_DELAY_MS = 2500;
+// How long to wait before the dedicated retry pass — gives WA full cool-down.
+const GL_RETRY_PASS_PRE_DELAY_MS = 5000;
+// Spacing between retries during the second pass.
+const GL_RETRY_PASS_DELAY_MS = 2000;
 
 async function fetchGroupLinksBackground(
   userId: string,
@@ -2794,38 +2801,82 @@ async function fetchGroupLinksBackground(
   mode: "all" | "similar",
   patternBase?: string
 ) {
-  const results: Array<{ subject: string; link: string | null }> = new Array(groups.length).fill(null).map((_, i) => ({ subject: groups[i].subject, link: null }));
+  const results: Array<{ subject: string; link: string | null; groupId: string }> =
+    groups.map(g => ({ subject: g.subject, link: null, groupId: g.id }));
   let fetchedCount = 0;
   let successCount = 0;
+  let consecutiveFailures = 0;
 
-  const updateProgress = async () => {
+  const updateProgress = async (extra?: string) => {
     try {
       const label = mode === "similar" ? `Fetching links for "${esc(patternBase!)}" groups` : "Fetching all group links";
       await bot.api.editMessageText(chatId, msgId,
-        `⏳ <b>${label}...</b>\n\n📊 ${fetchedCount}/${groups.length} fetched | ✅ ${successCount} links found`,
+        `⏳ <b>${label}...</b>\n\n📊 ${fetchedCount}/${groups.length} fetched | ✅ ${successCount} links found${extra ? `\n\n${extra}` : ""}`,
         { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("❌ Cancel", "gl_cancel_request") }
       );
     } catch {}
   };
 
+  // ── Pass 1: fetch each group's link with per-group retries ──
   for (let i = 0; i < groups.length; i += GL_BATCH_SIZE) {
     if (getLinkCancelRequests.has(Number(userId))) break;
     const batch = groups.slice(i, i + GL_BATCH_SIZE);
     const batchResults = await Promise.allSettled(
-      batch.map((g) => getGroupInviteLink(userId, g.id, 3))
+      batch.map((g) => getGroupInviteLink(userId, g.id, 5))
     );
 
+    let batchHadFailure = false;
     for (let j = 0; j < batch.length; j++) {
       const res = batchResults[j];
       const link = res.status === "fulfilled" ? res.value : null;
       results[i + j].link = link;
       fetchedCount++;
-      if (link) successCount++;
+      if (link) {
+        successCount++;
+        consecutiveFailures = 0;
+      } else {
+        batchHadFailure = true;
+        consecutiveFailures++;
+      }
     }
 
     await updateProgress();
     if (i + GL_BATCH_SIZE < groups.length) {
-      await new Promise((r) => setTimeout(r, GL_BATCH_DELAY_MS));
+      // Adaptive backpressure: if WA is throttling (3+ consecutive fails)
+      // back off harder so the retry pass has a clean window.
+      let delay = batchHadFailure ? GL_AFTER_FAIL_DELAY_MS : GL_BATCH_DELAY_MS;
+      if (consecutiveFailures >= 3) delay = Math.max(delay, 5000);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+
+  // ── Pass 2: dedicated retry for groups that failed in pass 1 ──
+  // This is the key fix for "7-8 out of 10 fetched" — those 2-3 missing ones
+  // are almost always WA throttle artifacts, not real failures. After a brief
+  // cool-down we try them again, slowly, and they almost always succeed.
+  const failedIndexes: number[] = [];
+  for (let i = 0; i < results.length; i++) {
+    if (!results[i].link) failedIndexes.push(i);
+  }
+
+  if (failedIndexes.length > 0 && !getLinkCancelRequests.has(Number(userId))) {
+    await updateProgress(`🔄 Retrying ${failedIndexes.length} pending link(s)...`);
+    await new Promise((r) => setTimeout(r, GL_RETRY_PASS_PRE_DELAY_MS));
+
+    for (let k = 0; k < failedIndexes.length; k++) {
+      if (getLinkCancelRequests.has(Number(userId))) break;
+      const idx = failedIndexes[k];
+      try {
+        const link = await getGroupInviteLink(userId, results[idx].groupId, 5);
+        if (link) {
+          results[idx].link = link;
+          successCount++;
+        }
+      } catch {}
+      await updateProgress(`🔄 Retrying ${k + 1}/${failedIndexes.length} pending link(s)...`);
+      if (k < failedIndexes.length - 1) {
+        await new Promise((r) => setTimeout(r, GL_RETRY_PASS_DELAY_MS));
+      }
     }
   }
 
