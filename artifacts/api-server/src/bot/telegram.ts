@@ -210,11 +210,36 @@ bot.use(async (ctx, next) => {
     // "✅ WhatsApp connected" toast from re-appearing on every /start.
     const startedNewSession = markUserActive(userId);
     newSessionFlag.set(userId, startedNewSession);
-    // If WhatsApp got disconnected (idle timer or process restart) but the
-    // user has a saved Mongo session, kick off a silent restore in the
-    // background so it's ready by the time they tap a feature button.
-    void ensureWhatsAppRestored(userId);
+
     try {
+      // Button press while WhatsApp is disconnected (typical 30-min idle
+      // disconnect case): show an in-place progress bar AND wait for the
+      // socket to come back up before letting the handler run. The handler
+      // then editMessageText's the same message into its actual UI, so the
+      // user lands directly on the screen they tapped — no need to /start
+      // again. Skip this dance for the connect/start/help flows since
+      // those are designed to handle the disconnected state themselves.
+      const cbData = ctx.callbackQuery?.data;
+      const skipReconnect = !cbData
+        || cbData === "connect_wa"
+        || cbData === "main_menu"
+        || cbData === "retry_reconnect"
+        || cbData.startsWith("connect_")
+        || cbData.startsWith("disconnect_")
+        || cbData.startsWith("logout_");
+      if (cbData && !skipReconnect && !isConnected(String(userId))) {
+        const ok = await reconnectInPlaceForCallback(ctx, userId);
+        if (!ok) {
+          // Reconnect failed — don't run the handler, the helper already
+          // edited the message with an error + retry buttons.
+          return;
+        }
+      } else {
+        // Either non-callback update (text/command) or already connected:
+        // fire-and-forget background restore as a safety net.
+        void ensureWhatsAppRestored(userId);
+      }
+
       await updateUserCtx.run(userId, next);
     } finally {
       newSessionFlag.delete(userId);
@@ -222,6 +247,26 @@ bot.use(async (ctx, next) => {
   } else {
     await next();
   }
+});
+
+// "Retry" button shown when reconnect-in-place fails. Forces a fresh attempt
+// — the middleware itself will pick it up via the regular flow, since this
+// callback's data starts a new chain through bot.use.
+bot.callbackQuery("retry_reconnect", async (ctx) => {
+  // The middleware can't intercept this one (we exempted it to avoid an
+  // infinite loop on persistent failures). Run a single attempt here and
+  // bounce the user back to the main menu either way.
+  await ctx.answerCallbackQuery({ text: "🔄 Trying again..." });
+  const userId = ctx.from.id;
+  const ok = await reconnectInPlaceForCallback(ctx, userId);
+  if (!ok) return; // helper already showed the error UI
+  // Success — drop the user back at the main menu.
+  try {
+    await ctx.editMessageText(
+      `✅ <b>WhatsApp reconnected</b>\n\nAap kya karna chahte ho?`,
+      { parse_mode: "HTML", reply_markup: new InlineKeyboard().text("🏠 Main Menu", "main_menu") }
+    );
+  } catch {}
 });
 
 type TelegramButtonStyle = "primary" | "success" | "danger";
@@ -820,6 +865,94 @@ async function ensureWhatsAppRestored(userId: number): Promise<void> {
       console.error(`[BOT] silent restore failed for ${userId}:`, err?.message);
     });
   } catch {}
+}
+
+// In-place WhatsApp reconnect for button presses. Called from the middleware
+// when a callback query lands while the user is disconnected (typically
+// because the 30-min idle disconnect fired). Edits the callback message into
+// a live progress bar, waits for the socket to come up, and returns true on
+// success. The downstream handler then runs as normal — its own
+// editMessageText replaces our progress text with the actual button content,
+// so the user lands directly on the screen they tapped without needing a
+// /start round-trip. Returns false on failure (timeout / no creds), in which
+// case the caller should ABORT the handler so the user gets a clear error
+// message instead of the usual "WhatsApp not connected" toast on every step.
+async function reconnectInPlaceForCallback(ctx: any, userId: number): Promise<boolean> {
+  const uid = String(userId);
+  if (isConnected(uid)) return true;
+
+  let hasStored = false;
+  try { hasStored = await hasStoredWhatsAppSession(uid); } catch {}
+  if (!hasStored) return false;
+
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  const msgId = ctx.callbackQuery?.message?.message_id;
+
+  // Acknowledge the callback so the Telegram spinner stops; the actual
+  // handler will call answerCallbackQuery again, which Telegram silently
+  // ignores once acked.
+  try { await ctx.answerCallbackQuery({ text: "🔄 Reconnecting WhatsApp..." }); } catch {}
+
+  const TOTAL_MS = 25000;
+  const TICK_MS = 1000;
+  const start = Date.now();
+
+  // Initial progress paint — only if we have a message to edit.
+  const renderBar = (pct: number) => {
+    const filled = Math.max(0, Math.min(10, Math.round(pct / 10)));
+    return `[${"█".repeat(filled)}${"░".repeat(10 - filled)}]`;
+  };
+  const renderText = (pct: number) =>
+    `🔄 <b>Reconnecting WhatsApp...</b>\n\n` +
+    `${renderBar(pct)} ${pct}%\n\n` +
+    `<i>Aap idle the to WhatsApp disconnect ho gaya tha. Wapas connect ho raha hai — ek second ruko, phir aapka button automatically khulega.</i>`;
+
+  if (chatId && msgId) {
+    try {
+      await ctx.api.editMessageText(chatId, msgId, renderText(5), {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [] },
+      });
+    } catch {}
+  }
+
+  // Kick off restore (idempotent — ensureSessionLoaded guards concurrency).
+  const restorePromise = ensureSessionLoaded(uid).catch(() => false);
+
+  let lastPct = 5;
+  while (Date.now() - start < TOTAL_MS) {
+    if (isConnected(uid)) break;
+    await new Promise((r) => setTimeout(r, TICK_MS));
+    const pct = Math.min(95, Math.round(((Date.now() - start) / TOTAL_MS) * 100));
+    if (chatId && msgId && pct - lastPct >= 10) {
+      lastPct = pct;
+      try {
+        await ctx.api.editMessageText(chatId, msgId, renderText(pct), { parse_mode: "HTML" });
+      } catch {}
+    }
+  }
+
+  await restorePromise.catch(() => {});
+  if (isConnected(uid)) return true;
+
+  // Failure path — surface a clear actionable error instead of letting the
+  // handler emit its generic "not connected" message.
+  if (chatId && msgId) {
+    try {
+      await ctx.api.editMessageText(
+        chatId, msgId,
+        `❌ <b>Reconnect failed</b>\n\nWhatsApp connection restore nahi ho payi. Please try again or reconnect manually.`,
+        {
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: [
+            [{ text: "🔁 Retry", callback_data: "retry_reconnect" }],
+            [{ text: "📱 Connect", callback_data: "connect_wa" }, { text: "🏠 Menu", callback_data: "main_menu" }],
+          ]},
+        }
+      );
+    } catch {}
+  }
+  return false;
 }
 const joinCancelRequests: Set<number> = new Set();
 const getLinkCancelRequests: Set<number> = new Set();
@@ -3124,7 +3257,6 @@ async function ctcCheckBackground(userId: string, activePairs: CtcPair[], chatId
     gr: typeof groupResults[number];
     correctPendingCount: number;
     correctMembersCount: number;
-    notInVcfCount: number;
     wrongPending: string[];          // "+91XXXXXXXXXX" formatted
     wrongPendingFull: number;        // actual count (may exceed shown list)
     vcfLast10Set: Set<string>;
