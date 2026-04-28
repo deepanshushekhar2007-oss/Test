@@ -214,6 +214,42 @@ bot.use(async (ctx, next) => {
     // user has a saved Mongo session, kick off a silent restore in the
     // background so it's ready by the time they tap a feature button.
     void ensureWhatsAppRestored(userId);
+
+    // Auto-redirect to main menu when a feature button is tapped while
+    // WhatsApp is disconnected (typical 30-min idle case). Without this the
+    // user has to manually /start every time after idle. We edit the same
+    // message into the main menu (with a small "reconnecting" hint), kick
+    // off the restore in the background, and skip the original handler so
+    // it doesn't show its own "❌ WhatsApp not connected" error. The user
+    // sees the menu, can re-tap their button after a couple seconds, and
+    // by then the socket is up. Connect / menu / language flows are
+    // exempted because they handle the disconnected state on purpose.
+    const cbData = ctx.callbackQuery?.data;
+    const skipRedirect = !cbData
+      || cbData === "connect_wa"
+      || cbData === "main_menu"
+      || cbData.startsWith("connect_")
+      || cbData.startsWith("disconnect_")
+      || cbData.startsWith("logout_")
+      || cbData.startsWith("lang_")
+      || cbData.startsWith("force_sub_");
+    if (cbData && !skipRedirect && !isConnected(String(userId))) {
+      let hasStored = false;
+      try { hasStored = await hasStoredWhatsAppSession(String(userId)); } catch {}
+      if (hasStored) {
+        try { await ctx.answerCallbackQuery({ text: "🔄 Reconnecting WhatsApp, ek second ruko..." }); } catch {}
+        try {
+          await ctx.editMessageText(
+            `🔄 <b>WhatsApp reconnecting...</b>\n\n` +
+            `<i>Aap idle the to disconnect ho gaya tha. 5-10 second ruko, phir wapas button dabao.</i>\n\n` +
+            mainMenuText(userId, "menu"),
+            { parse_mode: "HTML", reply_markup: mainMenu(userId) }
+          );
+        } catch {}
+        return;
+      }
+    }
+
     try {
       await updateUserCtx.run(userId, next);
     } finally {
