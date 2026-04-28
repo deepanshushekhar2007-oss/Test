@@ -1186,6 +1186,11 @@ async function showWhatsAppConnectingProgress(ctx: any, userId: number): Promise
         `✅ <b>WhatsApp connected${phoneTxt}</b>\n${renderProgressBar(100)}`,
         { parse_mode: "HTML" }
       );
+      // Auto-delete the success message after 5s so the chat stays clean —
+      // user already sees the menu right below it.
+      setTimeout(() => {
+        ctx.api.deleteMessage(msg.chat.id, msg.message_id).catch(() => {});
+      }, 5000);
     } else {
       await ctx.api.editMessageText(
         msg.chat.id,
