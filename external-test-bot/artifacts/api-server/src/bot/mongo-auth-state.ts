@@ -123,11 +123,21 @@ export async function useMongoDBAuthState(userId: string) {
 
   await ensureNoSessionTtlIndexes(credsCollection, keysCollection);
 
-  await credsCollection.createIndex({ userId: 1 }, { unique: false });
-  await keysCollection.createIndex(
-    { userId: 1, category: 1, id: 1 },
-    { unique: true }
-  );
+  try {
+    await credsCollection.createIndex({ userId: 1 }, { unique: false });
+  } catch (err: any) {
+    const msg = String(err?.message || "");
+    if (err?.code !== 26 && !msg.includes("ns does not exist")) throw err;
+  }
+  try {
+    await keysCollection.createIndex(
+      { userId: 1, category: 1, id: 1 },
+      { unique: true }
+    );
+  } catch (err: any) {
+    const msg = String(err?.message || "");
+    if (err?.code !== 26 && !msg.includes("ns does not exist")) throw err;
+  }
 
   const readCreds = async () => {
     const doc = await credsCollection.findOne({ _id: userId as any });

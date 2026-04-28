@@ -9,12 +9,7 @@ export async function getMongoDb(): Promise<Db> {
   if (!uri) {
     throw new Error("MONGODB_URI environment variable is required");
   }
-  client = new MongoClient(uri, {
-    maxPoolSize: 3,       // Limit pool (default is 5+, each connection ~10MB)
-    minPoolSize: 1,       // Keep min 1 connection alive
-    serverSelectionTimeoutMS: 10000,
-    socketTimeoutMS: 30000,
-  });
+  client = new MongoClient(uri);
   await client.connect();
   const dbName = process.env["MONGODB_DB_NAME"] || "whatsapp_bot";
   db = client.db(dbName);

@@ -5,8 +5,6 @@ interface BotData {
   accessList: Record<string, { expiresAt: number; grantedBy: number }>;
   bannedUsers: number[];
   totalUsers: number[];
-  autoChatEnabled: boolean;
-  autoChatAccessList: number[];
 }
 
 const DEFAULT_DATA: BotData = {
@@ -14,8 +12,6 @@ const DEFAULT_DATA: BotData = {
   accessList: {},
   bannedUsers: [],
   totalUsers: [],
-  autoChatEnabled: true,
-  autoChatAccessList: [],
 };
 
 export async function loadBotData(): Promise<BotData> {
@@ -28,8 +24,6 @@ export async function loadBotData(): Promise<BotData> {
         accessList: doc.accessList ?? {},
         bannedUsers: doc.bannedUsers ?? [],
         totalUsers: doc.totalUsers ?? [],
-        autoChatEnabled: doc.autoChatEnabled ?? true,
-        autoChatAccessList: doc.autoChatAccessList ?? [],
       };
     }
   } catch (err: any) {
@@ -49,8 +43,6 @@ export async function saveBotData(data: BotData): Promise<void> {
           accessList: data.accessList,
           bannedUsers: data.bannedUsers,
           totalUsers: data.totalUsers,
-          autoChatEnabled: data.autoChatEnabled,
-          autoChatAccessList: data.autoChatAccessList,
           updatedAt: new Date(),
         },
       },
@@ -66,7 +58,7 @@ export async function trackUser(userId: number): Promise<void> {
     const col = await getCollection("bot_data");
     await col.updateOne(
       { _id: "main" as any },
-      { $addToSet: { totalUsers: userId }, $setOnInsert: { subscriptionMode: false, accessList: {}, bannedUsers: [], autoChatEnabled: true, autoChatAccessList: [] } },
+      { $addToSet: { totalUsers: userId }, $setOnInsert: { subscriptionMode: false, accessList: {}, bannedUsers: [] } },
       { upsert: true }
     );
   } catch (err: any) {
