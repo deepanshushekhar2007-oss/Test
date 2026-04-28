@@ -28,6 +28,7 @@ import {
   isUserInGroup,
   getConnectedWhatsAppNumber,
   sendGroupMessage,
+  sendDirectMessage,
   getAutoUserId,
   isAutoConnected,
   getAutoConnectedNumber,
@@ -420,6 +421,11 @@ interface UserState {
     delaySeconds: number;
     cancelled: boolean;
   };
+  unbanGroupData?: {
+    allGroups: Array<{ id: string; subject: string }>;
+    selectedIndices: Set<number>;
+    page: number;
+  };
   autoConnectStep?: string;
 }
 
@@ -678,7 +684,7 @@ function mainMenu(userId?: number): InlineKeyboard {
     .text("🚪 Leave Group", "leave_group").text("🗑️ Remove Members", "remove_members").row()
     .text("👑 Make Admin", "make_admin").text("✅ Approval", "approval").row()
     .text("📋 Get Pending List", "pending_list").text("➕ Add Members", "add_members").row()
-    .text("💬 Chat In Group", "chat_in_group").row();
+    .text("💬 Chat In Group", "chat_in_group").text("🔓 Unban Group", "unban_group").row();
   if (!autoConnected) {
     kb.text("🤖 Connect Auto Chat WA", "connect_auto_wa").row();
   } else {
@@ -5099,6 +5105,246 @@ function downloadBuffer(url: string): Promise<Buffer> {
     }).on("error", reject);
   });
 }
+
+// ─── Unban Group ─────────────────────────────────────────────────────────────
+
+const UB_PAGE_SIZE = 20;
+const WHATSAPP_SUPPORT_NUMBER = process.env["WHATSAPP_SUPPORT_NUMBER"] || "447782668567";
+
+function buildUnbanGroupKeyboard(state: UserState): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  const allGroups = state.unbanGroupData!.allGroups;
+  const selected = state.unbanGroupData!.selectedIndices;
+  const page = state.unbanGroupData!.page || 0;
+  const totalPages = Math.max(1, Math.ceil(allGroups.length / UB_PAGE_SIZE));
+  const start = page * UB_PAGE_SIZE;
+  const end = Math.min(start + UB_PAGE_SIZE, allGroups.length);
+
+  for (let i = start; i < end; i++) {
+    const g = allGroups[i];
+    const isSelected = selected.has(i);
+    const label = isSelected ? `✅ ${g.subject}` : `☐ ${g.subject}`;
+    kb.text(label, `ub_tog_${i}`).row();
+  }
+
+  if (totalPages > 1) {
+    if (page > 0) kb.text("⬅️ Previous", "ub_page_prev");
+    kb.text(`📄 ${page + 1}/${totalPages}`, "ub_page_info");
+    if (page < totalPages - 1) kb.text("➡️ Next", "ub_page_next");
+    kb.row();
+  }
+
+  if (allGroups.length > 0) {
+    kb.text("☑️ Select All (page)", "ub_select_page").text("⬜ Clear", "ub_clear").row();
+  }
+
+  if (selected.size > 0) {
+    kb.text(`📞 WhatsApp Support (${selected.size})`, "ub_support").row();
+  }
+
+  kb.text("🏠 Back", "main_menu");
+  return kb;
+}
+
+bot.callbackQuery("unban_group", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  if (!(await checkAccessMiddleware(ctx))) return;
+  if (!isConnected(String(userId))) {
+    await ctx.editMessageText("❌ <b>WhatsApp not connected!</b>", {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("📱 Connect", "connect_wa").text("🏠 Menu", "main_menu"),
+    }); return;
+  }
+  await ctx.editMessageText("🔍 <b>Scanning your groups...</b>", { parse_mode: "HTML" });
+  const allGroups = await getAllGroups(String(userId));
+  if (!allGroups.length) {
+    await ctx.editMessageText("📭 <b>No groups found.</b>", {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard().text("🏠 Menu", "main_menu"),
+    }); return;
+  }
+  const sortedGroups = allGroups
+    .map((g) => ({ id: g.id, subject: g.subject }))
+    .sort((a, b) => a.subject.localeCompare(b.subject));
+
+  userStates.set(userId, {
+    step: "unban_group_select",
+    unbanGroupData: {
+      allGroups: sortedGroups,
+      selectedIndices: new Set(),
+      page: 0,
+    },
+  });
+
+  const state = userStates.get(userId)!;
+  await ctx.editMessageText(
+    `🔓 <b>Unban Group</b>\n\n` +
+      `Select the groups you want to send unban requests for.\n` +
+      `Multiple groups can be selected — bot will send requests one-by-one to WhatsApp Support.\n\n` +
+      `📊 Total groups: <b>${sortedGroups.length}</b>`,
+    { parse_mode: "HTML", reply_markup: buildUnbanGroupKeyboard(state) }
+  );
+});
+
+bot.callbackQuery(/^ub_tog_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.unbanGroupData) return;
+  const idx = parseInt(ctx.match![1], 10);
+  if (state.unbanGroupData.selectedIndices.has(idx)) {
+    state.unbanGroupData.selectedIndices.delete(idx);
+  } else {
+    state.unbanGroupData.selectedIndices.add(idx);
+  }
+  try {
+    await ctx.editMessageReplyMarkup({ reply_markup: buildUnbanGroupKeyboard(state) });
+  } catch {}
+});
+
+bot.callbackQuery("ub_page_prev", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const state = userStates.get(ctx.from.id);
+  if (!state?.unbanGroupData) return;
+  state.unbanGroupData.page = Math.max(0, (state.unbanGroupData.page || 0) - 1);
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildUnbanGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("ub_page_next", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const state = userStates.get(ctx.from.id);
+  if (!state?.unbanGroupData) return;
+  const total = state.unbanGroupData.allGroups.length;
+  const totalPages = Math.max(1, Math.ceil(total / UB_PAGE_SIZE));
+  state.unbanGroupData.page = Math.min(totalPages - 1, (state.unbanGroupData.page || 0) + 1);
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildUnbanGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("ub_page_info", async (ctx) => { await ctx.answerCallbackQuery(); });
+
+bot.callbackQuery("ub_select_page", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const state = userStates.get(ctx.from.id);
+  if (!state?.unbanGroupData) return;
+  const page = state.unbanGroupData.page || 0;
+  const start = page * UB_PAGE_SIZE;
+  const end = Math.min(start + UB_PAGE_SIZE, state.unbanGroupData.allGroups.length);
+  for (let i = start; i < end; i++) state.unbanGroupData.selectedIndices.add(i);
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildUnbanGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("ub_clear", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const state = userStates.get(ctx.from.id);
+  if (!state?.unbanGroupData) return;
+  state.unbanGroupData.selectedIndices.clear();
+  try { await ctx.editMessageReplyMarkup({ reply_markup: buildUnbanGroupKeyboard(state) }); } catch {}
+});
+
+bot.callbackQuery("ub_support", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.unbanGroupData) return;
+  const indices = Array.from(state.unbanGroupData.selectedIndices);
+  if (!indices.length) return;
+  const groups = indices.map((i) => state.unbanGroupData!.allGroups[i]);
+
+  const supportDigits = WHATSAPP_SUPPORT_NUMBER.replace(/[^0-9]/g, "");
+  const preview = groups.slice(0, 8).map((g) => `• ${esc(g.subject)}`).join("\n");
+  const more = groups.length > 8 ? `\n…and ${groups.length - 8} more` : "";
+
+  await ctx.editMessageText(
+    `📞 <b>WhatsApp Support</b>\n\n` +
+      `The bot will send <b>${groups.length}</b> unban request(s) one-by-one from your connected WhatsApp to:\n` +
+      `<code>+${esc(supportDigits)}</code>\n\n` +
+      `<b>Selected groups:</b>\n${preview}${more}\n\n` +
+      `Continue?`,
+    {
+      parse_mode: "HTML",
+      reply_markup: new InlineKeyboard()
+        .text("✅ Send Requests", "ub_send_yes")
+        .text("❌ Cancel", "unban_group"),
+    }
+  );
+});
+
+function buildUnbanRequestMessage(group: { id: string; subject: string }, userPhone: string | null): string {
+  const groupId = (group.id || "").split("@")[0];
+  const phoneLine = userPhone ? `\nMy WhatsApp number: +${userPhone.replace(/[^0-9]/g, "")}` : "";
+  return (
+    `Hello WhatsApp Support,\n\n` +
+    `I am writing to request the unbanning of my WhatsApp group.\n\n` +
+    `Group name: ${group.subject}\n` +
+    `Group ID: ${groupId}${phoneLine}\n\n` +
+    `This group was banned and I believe it was a mistake. ` +
+    `Please review and restore access to this group.\n\n` +
+    `Thank you for your assistance.`
+  );
+}
+
+bot.callbackQuery("ub_send_yes", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const userId = ctx.from.id;
+  const state = userStates.get(userId);
+  if (!state?.unbanGroupData) return;
+  const indices = Array.from(state.unbanGroupData.selectedIndices);
+  if (!indices.length) return;
+  const groups = indices.map((i) => state.unbanGroupData!.allGroups[i]);
+
+  const chatId = ctx.callbackQuery.message?.chat.id;
+  const msgId = ctx.callbackQuery.message?.message_id;
+  if (!chatId || !msgId) return;
+
+  userStates.delete(userId);
+  const userPhone = getConnectedWhatsAppNumber(String(userId));
+  const supportDigits = WHATSAPP_SUPPORT_NUMBER.replace(/[^0-9]/g, "");
+
+  await ctx.editMessageText(
+    `⏳ <b>Sending ${groups.length} request(s) to WhatsApp Support...</b>\n\n🔄 0/${groups.length} done...`,
+    { parse_mode: "HTML" }
+  );
+
+  void (async () => {
+    const lines: string[] = [];
+    let success = 0, failed = 0;
+    for (let li = 0; li < groups.length; li++) {
+      const g = groups[li];
+      const text = buildUnbanRequestMessage(g, userPhone);
+      const ok = await sendDirectMessage(String(userId), supportDigits, text);
+      if (ok) { lines.push(`✅ Sent: ${esc(g.subject)}`); success++; }
+      else { lines.push(`❌ Failed: ${esc(g.subject)}`); failed++; }
+      try {
+        await bot.api.editMessageText(
+          chatId, msgId,
+          `⏳ <b>Sending: ${li + 1}/${groups.length}</b>\n\n${lines.slice(-15).join("\n")}`,
+          { parse_mode: "HTML" }
+        );
+      } catch {}
+      if (li < groups.length - 1) await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    const result =
+      `🔓 <b>Unban Requests Result</b>\n\n` +
+      lines.join("\n") +
+      `\n\n📊 <b>Done! ✅ ${success} sent | ❌ ${failed} failed</b>\n\n` +
+      `📞 Support number: <code>+${esc(supportDigits)}</code>`;
+    const chunks = splitMessage(result, 4000);
+    try {
+      await bot.api.editMessageText(chatId, msgId, chunks[0], {
+        parse_mode: "HTML",
+        reply_markup: chunks.length === 1 ? new InlineKeyboard().text("🏠 Main Menu", "main_menu") : undefined,
+      });
+    } catch {}
+    for (let i = 1; i < chunks.length; i++) {
+      await bot.api.sendMessage(chatId, chunks[i], {
+        parse_mode: "HTML",
+        reply_markup: i === chunks.length - 1 ? new InlineKeyboard().text("🏠 Main Menu", "main_menu") : undefined,
+      });
+    }
+  })();
+});
 
 function splitMessage(msg: string, maxLen: number): string[] {
   const parts: string[] = [];
