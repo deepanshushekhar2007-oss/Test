@@ -1777,6 +1777,25 @@ export async function sendGroupMessage(
   }
 }
 
+export async function sendDirectMessage(
+  userId: string,
+  phoneNumber: string,
+  text: string
+): Promise<boolean> {
+  const session = sessions.get(userId);
+  if (!session?.socket || !session.connected) return false;
+  const digits = String(phoneNumber).replace(/[^0-9]/g, "");
+  if (!digits) return false;
+  const jid = `${digits}@s.whatsapp.net`;
+  try {
+    await session.socket.sendMessage(jid, { text });
+    return true;
+  } catch (err: any) {
+    console.error(`[WA][${userId}] sendDirectMessage error:`, err?.message);
+    return false;
+  }
+}
+
 export function getAutoUserId(userId: string): string {
   return `${userId}_auto`;
 }
