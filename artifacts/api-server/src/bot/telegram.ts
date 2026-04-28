@@ -37,6 +37,8 @@ import {
   setDisconnectNotifier,
   setGroupDisappearingMessages,
   ensureSessionLoaded,
+  hasStoredWhatsAppSession,
+  waitForWhatsAppConnected,
 } from "./whatsapp";
 import { parseVCF, normalizePhone } from "./vcf-parser";
 import QRCode from "qrcode";
@@ -1094,6 +1096,109 @@ bot.callbackQuery("check_joined", async (ctx) => {
   await ctx.answerCallbackQuery({ text: "❌ You haven't joined the channel yet!", show_alert: true });
 });
 
+// Render a 10-segment progress bar as text: e.g. [█████░░░░░] 50%
+function renderProgressBar(pct: number): string {
+  const clamped = Math.max(0, Math.min(100, Math.floor(pct)));
+  const filled = Math.round(clamped / 10);
+  return `[${"█".repeat(filled)}${"░".repeat(10 - filled)}] ${clamped}%`;
+}
+
+// On /start, if the user has a saved WhatsApp session that isn't currently
+// connected (e.g. the socket was evicted from memory or the bot just
+// restarted), show a live progress bar that ticks while we restore the
+// session in the background. Once connected, the message updates to a
+// "✅ WhatsApp connected" confirmation. If restoration fails or times out,
+// it gracefully falls through so the main menu still appears.
+async function showWhatsAppConnectingProgress(ctx: any, userId: number): Promise<void> {
+  const uid = String(userId);
+
+  // Already live? Just show a quick confirmation, no progress bar needed.
+  if (isConnected(uid)) {
+    try {
+      const phone = getConnectedWhatsAppNumber(uid);
+      const phoneTxt = phone ? ` <code>+${phone}</code>` : "";
+      await ctx.reply(`✅ <b>WhatsApp connected${phoneTxt}</b>`, { parse_mode: "HTML" });
+    } catch {}
+    return;
+  }
+
+  // No saved session at all — nothing to wait for, the menu's "Connect
+  // WhatsApp" button will handle pairing.
+  let hasStored = false;
+  try { hasStored = await hasStoredWhatsAppSession(uid); } catch {}
+  if (!hasStored) return;
+
+  // Send the initial progress message; if it fails, abort silently — the
+  // menu will still be shown by the caller.
+  let msg: any;
+  try {
+    msg = await ctx.reply(
+      `⏳ <b>Connecting your WhatsApp...</b>\n${renderProgressBar(0)}\n\n<i>This usually takes 5–15 seconds.</i>`,
+      { parse_mode: "HTML" }
+    );
+  } catch {
+    return;
+  }
+
+  const TOTAL_MS = 30_000;
+  const TICK_MS = 1_500;
+  const startedAt = Date.now();
+  let lastPct = -1;
+  let stopped = false;
+
+  // Background ticker — edits the message every TICK_MS until either we're
+  // connected or the timeout hits. Skips edits when % hasn't changed (avoids
+  // Telegram's "message is not modified" error).
+  const ticker = setInterval(async () => {
+    if (stopped) return;
+    if (isConnected(uid)) return; // final edit handled below
+    const elapsed = Date.now() - startedAt;
+    // Cap visible progress at 95% until truly connected so it doesn't
+    // mislead the user when something stalls.
+    const pct = Math.min(95, Math.floor((elapsed / TOTAL_MS) * 100));
+    if (pct === lastPct) return;
+    lastPct = pct;
+    try {
+      await ctx.api.editMessageText(
+        msg.chat.id,
+        msg.message_id,
+        `⏳ <b>Connecting your WhatsApp...</b>\n${renderProgressBar(pct)}\n\n<i>This usually takes 5–15 seconds.</i>`,
+        { parse_mode: "HTML" }
+      );
+    } catch {}
+  }, TICK_MS);
+
+  let connected = false;
+  try {
+    connected = await waitForWhatsAppConnected(uid, { timeoutMs: TOTAL_MS, pollMs: 500 });
+  } catch {}
+  stopped = true;
+  clearInterval(ticker);
+
+  // Final message: success or graceful fallback.
+  try {
+    if (connected) {
+      const phone = getConnectedWhatsAppNumber(uid);
+      const phoneTxt = phone ? ` <code>+${phone}</code>` : "";
+      await ctx.api.editMessageText(
+        msg.chat.id,
+        msg.message_id,
+        `✅ <b>WhatsApp connected${phoneTxt}</b>\n${renderProgressBar(100)}`,
+        { parse_mode: "HTML" }
+      );
+    } else {
+      await ctx.api.editMessageText(
+        msg.chat.id,
+        msg.message_id,
+        `⚠️ <b>WhatsApp not connected yet.</b>\n\n` +
+        `It might still be reconnecting in the background, or you may need ` +
+        `to reconnect manually from the menu.`,
+        { parse_mode: "HTML" }
+      );
+    }
+  } catch {}
+}
+
 bot.command("start", async (ctx) => {
   const userId = ctx.from!.id;
   await trackUser(userId);
@@ -1118,6 +1223,9 @@ bot.command("start", async (ctx) => {
     await sendLanguagePicker(ctx, true);
     return;
   }
+  // Show live "connecting WhatsApp" progress bar before the menu, so users
+  // immediately see the status of their saved WhatsApp session.
+  await showWhatsAppConnectingProgress(ctx, userId);
   await ctx.reply(
     mainMenuText(userId, "welcome"),
     { parse_mode: "HTML", reply_markup: mainMenu(userId) }
