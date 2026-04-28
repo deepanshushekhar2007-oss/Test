@@ -1,7 +1,7 @@
 import app from "./app";
 import { logger } from "./lib/logger";
 import { startBot } from "./bot/telegram";
-import { restoreWhatsAppSessions, getActiveSessionUserIds } from "./bot/whatsapp";
+import { restoreWhatsAppSessions, getActiveSessionUserIds, sweepIdleSessions } from "./bot/whatsapp";
 import { getMongoDb, closeMongoDb } from "./bot/mongodb";
 import { cleanupStaleSessions } from "./bot/mongo-auth-state";
 import https from "https";
@@ -80,11 +80,14 @@ async function main() {
   await getMongoDb();
   console.log("[INIT] MongoDB connected successfully");
 
-  // Stale sessions startup pe delete karo, uske baad active sessions restore karo
+  // Stale sessions startup pe delete karo
   await runSessionCleanup("STARTUP");
 
-  await restoreWhatsAppSessions();
-
+  // Bot aur HTTP server pehle start karo — Telegram updates turant accept ho.
+  // WhatsApp sessions background mein restore hongi (har ek 5s stagger se).
+  // Iska matlab user button click karega to bot turant respond karega, beshak
+  // WhatsApp socket abhi restoring ho. Pehle yeh blocking await tha jiski wajah
+  // se 30+ seconds tak bot Telegram updates accept hi nahi karta tha.
   app.listen(port, (err) => {
     if (err) {
       logger.error({ err }, "Error listening on port");
@@ -113,6 +116,21 @@ async function main() {
       runSessionCleanup("DAILY-CLEANUP");
     }, 24 * 60 * 60 * 1000);
 
+    // Har 1 minute mein idle WhatsApp sockets close karo (memory pressure
+    // kam karne ke liye). Ye 30 min se idle sessions ko evict karta hai aur
+    // RSS jab >380MB ho to LRU se aur close karta hai. User wapas aaye to
+    // session lazy-restore ho jayegi.
+    setInterval(() => {
+      try {
+        const { evicted, total } = sweepIdleSessions();
+        if (evicted > 0) {
+          console.log(`[WA][SWEEP] Evicted ${evicted} idle session(s); ${total} live remaining`);
+        }
+      } catch (err: any) {
+        console.error(`[WA][SWEEP] failed:`, err?.message);
+      }
+    }, 60 * 1000);
+
     // Har 5 minute mein GC chalao memory free karne ke liye + heap usage log
     const fmtMb = (n: number) => `${(n / 1024 / 1024).toFixed(0)}MB`;
     setInterval(() => {
@@ -129,6 +147,12 @@ async function main() {
   });
 
   startBot();
+
+  // Fire-and-forget: WhatsApp sessions background mein restore karo. Iska
+  // result wait karne ki zaroorat nahi — bot already responsive hai.
+  void restoreWhatsAppSessions().catch((err: any) => {
+    console.error(`[WA][RESTORE] background restore failed:`, err?.message);
+  });
 }
 
 process.on("uncaughtException", (err: any) => {
