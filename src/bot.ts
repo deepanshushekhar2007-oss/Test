@@ -115,8 +115,7 @@ async function checkPaymentStatus(url: string): Promise<PaymentStatus> {
 }
 
 // ── Concurrency-limited runner ─────────────────────────────────────────────
-// Runs at most `limit` tasks simultaneously.
-// Prevents overwhelming Stripe with 100+ simultaneous connections.
+// Runs at most `limit` tasks simultaneously instead of all at once.
 async function runWithConcurrency<T>(
   tasks: (() => Promise<T>)[],
   limit: number,
@@ -136,6 +135,10 @@ async function runWithConcurrency<T>(
   return results;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 type ResultStatus = PaymentStatus | "nolink";
 
 interface QRResult {
@@ -146,7 +149,9 @@ interface QRResult {
 // ── Per-chat session ──────────────────────────────────────────────────────
 interface ChatSession {
   entries: QREntry[];
-  // Debounce: fires one consolidated ack instead of one reply per message
+  // True while we are in the /done collection-window — message handler still
+  // adds entries but suppresses ack replies.
+  donePending: boolean;
   ackTimer: NodeJS.Timeout | null;
   pendingAckCount: number;
 }
@@ -155,7 +160,12 @@ const sessions = new Map<number, ChatSession>();
 
 function getSession(chatId: number): ChatSession {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { entries: [], ackTimer: null, pendingAckCount: 0 });
+    sessions.set(chatId, {
+      entries: [],
+      donePending: false,
+      ackTimer: null,
+      pendingAckCount: 0,
+    });
   }
   return sessions.get(chatId)!;
 }
@@ -223,7 +233,7 @@ Welcome\\! This bot instantly verifies the status of UPI QR payment links using 
 *🚀 How to use:*
 1\\. Forward or paste messages containing *QR \\#number* entries with payment links
 2\\. Keep sending as many QR messages as you need \\(even 100\\+\\)
-3\\. Type /done when finished — the bot checks all of them at once
+3\\. Type /done when finished — the bot waits a few seconds to collect all messages, then checks them all
 4\\. Type /reset at any time to clear the list and start fresh
 
 *📋 Commands:*
@@ -236,15 +246,27 @@ Welcome\\! This bot instantly verifies the status of UPI QR payment links using 
 👑 *Owner:* @SPIDYWS
 `.trim();
 
-// Max simultaneous Stripe requests — keeps server stable under large loads
+// How many seconds to wait after /done before snapshotting.
+// This window lets any in-flight Telegram messages arrive first.
+const COLLECTION_BUFFER_SECS = 4;
+
+// Max simultaneous Stripe requests
 const CONCURRENCY_LIMIT = 10;
+
 // How long to wait before sending a single consolidated ack (ms)
-const ACK_DEBOUNCE_MS = 2500;
+const ACK_DEBOUNCE_MS = 2000;
 
 export function startBot(): void {
   if (!TOKEN) return;
 
-  const bot = new TelegramBot(TOKEN, { polling: true });
+  // Use a short polling interval so messages arrive quickly
+  const bot = new TelegramBot(TOKEN, {
+    polling: {
+      interval: 100,
+      autoStart: true,
+      params: { limit: 100, timeout: 10 },
+    },
+  });
   logger.info("Telegram bot started with polling");
 
   // ── /start ──────────────────────────────────────────────────────────────
@@ -252,7 +274,7 @@ export function startBot(): void {
     await bot.sendMessage(msg.chat.id, START_MESSAGE, { parse_mode: "MarkdownV2" });
   });
 
-  // ── /status — show queue size ────────────────────────────────────────────
+  // ── /status ──────────────────────────────────────────────────────────────
   bot.onText(/^\/status$/i, async (msg) => {
     const chatId = msg.chat.id;
     const session = getSession(chatId);
@@ -279,12 +301,15 @@ export function startBot(): void {
       { parse_mode: "MarkdownV2" });
   });
 
-  // ── /done — process all collected entries ────────────────────────────────
+  // ── /done — collect for a window, then process ───────────────────────────
   bot.onText(/^\/done$/i, async (msg) => {
     const chatId = msg.chat.id;
     const session = getSession(chatId);
 
-    // Cancel any pending debounced ack so it doesn't fire mid-processing
+    // Ignore duplicate /done while one is already in progress
+    if (session.donePending) return;
+
+    // Cancel any pending debounced ack
     if (session.ackTimer) {
       clearTimeout(session.ackTimer);
       session.ackTimer = null;
@@ -297,19 +322,61 @@ export function startBot(): void {
       return;
     }
 
-    const total = session.entries.length;
-    const processingMsg = await bot.sendMessage(chatId,
-      `⏳ *Checking ${total} QR entr${total === 1 ? "y" : "ies"}*\n\n` +
-      `░░░░░░░░░░ 0%\n*0/${total}* done — processing ${CONCURRENCY_LIMIT} at a time\\.`,
+    // Mark session as done-pending so:
+    //   • message handler keeps adding entries (without sending ack)
+    //   • duplicate /done commands are ignored
+    session.donePending = true;
+
+    // ── Phase 1: Collection window ─────────────────────────────────────
+    // Wait COLLECTION_BUFFER_SECS seconds so any in-flight Telegram messages
+    // (not yet delivered by polling) can arrive and be added to the session.
+    const collectMsg = await bot.sendMessage(chatId,
+      `📥 *Collecting all messages\\.\\.\\.*\n\n` +
+      `⏱ Waiting ${COLLECTION_BUFFER_SECS}s to make sure every QR is received\\.\n` +
+      `Queue so far: *${session.entries.length}* QR(s)`,
       { parse_mode: "MarkdownV2" });
 
-    // Snapshot entries and clear session immediately so new QRs can be queued
+    for (let sec = COLLECTION_BUFFER_SECS - 1; sec >= 0; sec--) {
+      await sleep(1000);
+      // Update the countdown and live queue count so user can watch it grow
+      await bot.editMessageText(
+        sec > 0
+          ? `📥 *Collecting all messages\\.\\.\\.*\n\n` +
+            `⏱ Starting in *${sec}s*\\.\\.\\.\n` +
+            `Queue so far: *${session.entries.length}* QR(s)`
+          : `📥 *Collection complete\\!*\n\n` +
+            `✅ Captured *${session.entries.length}* QR(s) total\\. Starting verification\\.\\.\\.`,
+        {
+          chat_id: chatId,
+          message_id: collectMsg.message_id,
+          parse_mode: "MarkdownV2",
+        },
+      ).catch(() => {});
+    }
+
+    // ── Phase 2: Snapshot & verify ────────────────────────────────────
+    // Now all in-flight messages have had time to arrive.
     const entriesToCheck = [...session.entries];
-    sessions.delete(chatId);
+    sessions.delete(chatId); // clear session — user can start a new batch
+
+    const total = entriesToCheck.length;
+
+    if (total === 0) {
+      await bot.editMessageText(`⚠️ *No QR entries found after collection window\\.* Please try again\\.`,
+        { chat_id: chatId, message_id: collectMsg.message_id, parse_mode: "MarkdownV2" }).catch(() => {});
+      return;
+    }
+
+    // Replace the collection message with the progress message
+    await bot.editMessageText(
+      `⏳ *Verifying ${total} QR entr${total === 1 ? "y" : "ies"}*\n\n` +
+      `░░░░░░░░░░ 0%\n*0 / ${total}* checked`,
+      { chat_id: chatId, message_id: collectMsg.message_id, parse_mode: "MarkdownV2" },
+    ).catch(() => {});
 
     let completed = 0;
     let lastEdited = 0;
-    const EDIT_EVERY = Math.max(1, Math.floor(total / 10)); // edit ~10 times total
+    const EDIT_EVERY = Math.max(1, Math.floor(total / 10));
 
     const tasks = entriesToCheck.map((entry) => async (): Promise<QRResult> => {
       let status: ResultStatus;
@@ -321,19 +388,18 @@ export function startBot(): void {
 
       completed++;
 
-      // Throttle progress edits to avoid Telegram rate limits
       if (completed - lastEdited >= EDIT_EVERY || completed === total) {
         lastEdited = completed;
         const pct = Math.round((completed / total) * 100);
         const bar = buildProgressBar(pct);
         bot.editMessageText(
-          `⏳ *Checking ${total} QR entr${total === 1 ? "y" : "ies"}*\n\n${bar}\n*${completed}/${total}* done`,
+          `⏳ *Verifying ${total} QR entr${total === 1 ? "y" : "ies"}*\n\n${bar}\n*${completed} / ${total}* checked`,
           {
             chat_id: chatId,
-            message_id: processingMsg.message_id,
+            message_id: collectMsg.message_id,
             parse_mode: "MarkdownV2",
           },
-        ).catch(() => { /* ignore edit race conditions */ });
+        ).catch(() => {});
       }
 
       return { qrNumber: entry.qrNumber, status };
@@ -342,15 +408,13 @@ export function startBot(): void {
     const results = await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
 
     try {
-      await bot.deleteMessage(chatId, processingMsg.message_id);
+      await bot.deleteMessage(chatId, collectMsg.message_id);
     } catch { /* ignore */ }
 
     await bot.sendMessage(chatId, buildReport(results), { parse_mode: "Markdown" });
   });
 
-  // ── Regular messages — collect QR entries with debounced ack ─────────────
-  // When 100 messages arrive at once, we DON'T reply to each one.
-  // Instead we wait ACK_DEBOUNCE_MS after the last message, then send one reply.
+  // ── Regular messages — collect QR entries ────────────────────────────────
   bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text || msg.caption || "";
@@ -371,9 +435,13 @@ export function startBot(): void {
     if (added.length === 0) return;
 
     session.entries.push(...added);
-    session.pendingAckCount += added.length;
 
-    // Reset the debounce timer — only fires after messages stop arriving
+    // If /done is already counting down, just silently add — no ack needed.
+    // The countdown message shows the live queue count.
+    if (session.donePending) return;
+
+    // Otherwise, debounce the ack: reset timer, fire ONE reply after silence
+    session.pendingAckCount += added.length;
     if (session.ackTimer) clearTimeout(session.ackTimer);
 
     session.ackTimer = setTimeout(async () => {
