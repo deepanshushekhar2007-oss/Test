@@ -16,7 +16,6 @@ function parseQREntries(
   text: string,
   entities: TelegramBot.MessageEntity[],
 ): QREntry[] {
-  // Find all QR numbers in order of appearance
   const qrPattern = /QR\s*#(\d+)/gi;
   const qrMatches: { number: string; index: number }[] = [];
   let match: RegExpExecArray | null;
@@ -26,12 +25,10 @@ function parseQREntries(
 
   if (qrMatches.length === 0) return [];
 
-  // Find all text_link entities (the payment links) sorted by position
   const linkEntities = (entities || [])
     .filter((e) => e.type === "text_link" && e.url)
     .sort((a, b) => a.offset - b.offset);
 
-  // Match each QR number with the corresponding link entity (positional)
   return qrMatches.map((qr, i) => ({
     qrNumber: qr.number,
     paymentUrl: linkEntities[i]?.url ?? null,
@@ -41,10 +38,6 @@ function parseQREntries(
 type PaymentStatus = "verified" | "expired" | "unknown";
 
 // ── Stripe direct API approach ──────────────────────────────────────────────
-// Stripe's UPI hosted payment page embeds a base64 JSON payload in a <meta> tag
-// that contains the publishable_key and client_secret. We fetch the HTML, extract
-// that payload, then call the Stripe API directly — no browser needed.
-
 async function fetchStripePayload(
   url: string,
 ): Promise<{ clientSecret: string; pubKey: string } | null> {
@@ -61,7 +54,6 @@ async function fetchStripePayload(
 
   const html = await resp.text();
 
-  // Extract data-message attribute from <meta id="payload" data-message="...">
   const match = html.match(/id="payload"\s+data-message="([^"]+)"/);
   if (!match) {
     logger.warn({ url }, "No Stripe payload meta tag found in page");
@@ -94,8 +86,7 @@ async function checkPaymentStatus(url: string): Promise<PaymentStatus> {
 
     const { clientSecret, pubKey } = payload;
 
-    // Determine intent type from the client_secret prefix
-    const intentId = clientSecret.split("_secret_")[0]; // e.g. seti_xxx or pi_xxx
+    const intentId = clientSecret.split("_secret_")[0];
     const intentType = intentId.startsWith("seti_")
       ? "setup_intents"
       : "payment_intents";
@@ -113,26 +104,36 @@ async function checkPaymentStatus(url: string): Promise<PaymentStatus> {
 
     logger.info({ url, intentId, intentType, status }, "Stripe API status");
 
-    // ── Map Stripe status to our result ──────────────────────────────────
-    // SetupIntents: succeeded | canceled | processing | requires_action | requires_payment_method | requires_confirmation
-    // PaymentIntents: succeeded | canceled | processing | requires_action | requires_payment_method | requires_capture | requires_confirmation
-    if (status === "succeeded" || status === "requires_capture") {
-      return "verified";
-    }
+    if (status === "succeeded" || status === "requires_capture") return "verified";
+    if (status === "canceled" || status === "requires_payment_method") return "expired";
 
-    if (
-      status === "canceled" ||
-      status === "requires_payment_method" // payment never attempted / expired session
-    ) {
-      return "expired";
-    }
-
-    // processing / requires_action / requires_confirmation → still in flight
     return "unknown";
   } catch (err) {
     logger.error({ err, url }, "Error checking Stripe payment status");
     return "unknown";
   }
+}
+
+// ── Concurrency-limited runner ─────────────────────────────────────────────
+// Runs at most `limit` tasks simultaneously.
+// Prevents overwhelming Stripe with 100+ simultaneous connections.
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  limit: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < tasks.length) {
+      const i = nextIndex++;
+      results[i] = await tasks[i]!();
+    }
+  }
+
+  const workerCount = Math.min(limit, tasks.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 type ResultStatus = PaymentStatus | "nolink";
@@ -142,16 +143,27 @@ interface QRResult {
   status: ResultStatus;
 }
 
-// ── Per-chat session: accumulate entries until /done ──────────────────────────
+// ── Per-chat session ──────────────────────────────────────────────────────
 interface ChatSession {
-  entries: QREntry[]; // collected so far
+  entries: QREntry[];
+  // Debounce: fires one consolidated ack instead of one reply per message
+  ackTimer: NodeJS.Timeout | null;
+  pendingAckCount: number;
 }
 
 const sessions = new Map<number, ChatSession>();
 
 function getSession(chatId: number): ChatSession {
-  if (!sessions.has(chatId)) sessions.set(chatId, { entries: [] });
+  if (!sessions.has(chatId)) {
+    sessions.set(chatId, { entries: [], ackTimer: null, pendingAckCount: 0 });
+  }
   return sessions.get(chatId)!;
+}
+
+function buildProgressBar(pct: number): string {
+  const filled = Math.round(pct / 10);
+  const empty  = 10 - filled;
+  return `${"█".repeat(filled)}${"░".repeat(empty)} ${pct}%`;
 }
 
 function buildReport(results: QRResult[]): string {
@@ -210,12 +222,13 @@ Welcome\\! This bot instantly verifies the status of UPI QR payment links using 
 
 *🚀 How to use:*
 1\\. Forward or paste messages containing *QR \\#number* entries with payment links
-2\\. Keep sending as many QR messages as you need
-3\\. Type /done when you are finished — the bot will check all of them at once
-4\\. Type /reset at any time to clear the current list and start fresh
+2\\. Keep sending as many QR messages as you need \\(even 100\\+\\)
+3\\. Type /done when finished — the bot checks all of them at once
+4\\. Type /reset at any time to clear the list and start fresh
 
 *📋 Commands:*
 /start — Show this help message
+/status — Show how many QRs are in the queue
 /done — Check all collected QR entries
 /reset — Clear the current list and start over
 
@@ -223,86 +236,128 @@ Welcome\\! This bot instantly verifies the status of UPI QR payment links using 
 👑 *Owner:* @SPIDYWS
 `.trim();
 
+// Max simultaneous Stripe requests — keeps server stable under large loads
+const CONCURRENCY_LIMIT = 10;
+// How long to wait before sending a single consolidated ack (ms)
+const ACK_DEBOUNCE_MS = 2500;
+
 export function startBot(): void {
   if (!TOKEN) return;
 
   const bot = new TelegramBot(TOKEN, { polling: true });
   logger.info("Telegram bot started with polling");
 
-  // ── /start — welcome & help ─────────────────────────────────────────────
+  // ── /start ──────────────────────────────────────────────────────────────
   bot.onText(/^\/start$/i, async (msg) => {
-    const chatId = msg.chat.id;
-    await bot.sendMessage(chatId, START_MESSAGE, {
-      parse_mode: "MarkdownV2",
-    });
+    await bot.sendMessage(msg.chat.id, START_MESSAGE, { parse_mode: "MarkdownV2" });
   });
 
-  // ── /reset — clear session ──────────────────────────────────────────────
+  // ── /status — show queue size ────────────────────────────────────────────
+  bot.onText(/^\/status$/i, async (msg) => {
+    const chatId = msg.chat.id;
+    const session = getSession(chatId);
+    const count = session.entries.length;
+    if (count === 0) {
+      await bot.sendMessage(chatId,
+        `📭 *Queue is empty*\n\nNo QR entries collected yet\\. Send some messages and try again\\.`,
+        { parse_mode: "MarkdownV2" });
+    } else {
+      await bot.sendMessage(chatId,
+        `📬 *Queue Status*\n\n*${count}* QR entr${count === 1 ? "y" : "ies"} ready to check\\.\nType /done to process them now\\.`,
+        { parse_mode: "MarkdownV2" });
+    }
+  });
+
+  // ── /reset ───────────────────────────────────────────────────────────────
   bot.onText(/^\/reset$/i, async (msg) => {
     const chatId = msg.chat.id;
+    const session = getSession(chatId);
+    if (session.ackTimer) clearTimeout(session.ackTimer);
     sessions.delete(chatId);
-    await bot.sendMessage(
-      chatId,
-      `🔄 *Session Reset!*\n\nYour QR list has been cleared\\. Send new QR messages and type /done when ready\\.`,
-      { parse_mode: "MarkdownV2" },
-    );
+    await bot.sendMessage(chatId,
+      `🔄 *Session Reset\\!*\n\nYour QR list has been cleared\\. Send new QR messages and type /done when ready\\.`,
+      { parse_mode: "MarkdownV2" });
   });
 
-  // ── /done — process all collected entries ───────────────────────────────
+  // ── /done — process all collected entries ────────────────────────────────
   bot.onText(/^\/done$/i, async (msg) => {
     const chatId = msg.chat.id;
     const session = getSession(chatId);
 
+    // Cancel any pending debounced ack so it doesn't fire mid-processing
+    if (session.ackTimer) {
+      clearTimeout(session.ackTimer);
+      session.ackTimer = null;
+    }
+
     if (session.entries.length === 0) {
-      await bot.sendMessage(
-        chatId,
+      await bot.sendMessage(chatId,
         `⚠️ *No QR entries found\\!*\n\nPlease send messages containing QR entries first, then type /done\\.`,
-        { parse_mode: "MarkdownV2" },
-      );
+        { parse_mode: "MarkdownV2" });
       return;
     }
 
     const total = session.entries.length;
-    const processingMsg = await bot.sendMessage(
-      chatId,
-      `⏳ *Checking ${total} QR entr${total === 1 ? "y" : "ies"}\\.\\.\\.*\n\nPlease wait while we verify each payment link\\.`,
-      { parse_mode: "MarkdownV2" },
-    );
+    const processingMsg = await bot.sendMessage(chatId,
+      `⏳ *Checking ${total} QR entr${total === 1 ? "y" : "ies"}*\n\n` +
+      `░░░░░░░░░░ 0%\n*0/${total}* done — processing ${CONCURRENCY_LIMIT} at a time\\.`,
+      { parse_mode: "MarkdownV2" });
 
-    // Check all in parallel
-    const results: QRResult[] = await Promise.all(
-      session.entries.map(async (entry): Promise<QRResult> => {
-        if (!entry.paymentUrl) {
-          return { qrNumber: entry.qrNumber, status: "nolink" };
-        }
-        const status = await checkPaymentStatus(entry.paymentUrl);
-        return { qrNumber: entry.qrNumber, status };
-      }),
-    );
-
-    // Clear session after processing
+    // Snapshot entries and clear session immediately so new QRs can be queued
+    const entriesToCheck = [...session.entries];
     sessions.delete(chatId);
+
+    let completed = 0;
+    let lastEdited = 0;
+    const EDIT_EVERY = Math.max(1, Math.floor(total / 10)); // edit ~10 times total
+
+    const tasks = entriesToCheck.map((entry) => async (): Promise<QRResult> => {
+      let status: ResultStatus;
+      if (!entry.paymentUrl) {
+        status = "nolink";
+      } else {
+        status = await checkPaymentStatus(entry.paymentUrl);
+      }
+
+      completed++;
+
+      // Throttle progress edits to avoid Telegram rate limits
+      if (completed - lastEdited >= EDIT_EVERY || completed === total) {
+        lastEdited = completed;
+        const pct = Math.round((completed / total) * 100);
+        const bar = buildProgressBar(pct);
+        bot.editMessageText(
+          `⏳ *Checking ${total} QR entr${total === 1 ? "y" : "ies"}*\n\n${bar}\n*${completed}/${total}* done`,
+          {
+            chat_id: chatId,
+            message_id: processingMsg.message_id,
+            parse_mode: "MarkdownV2",
+          },
+        ).catch(() => { /* ignore edit race conditions */ });
+      }
+
+      return { qrNumber: entry.qrNumber, status };
+    });
+
+    const results = await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
 
     try {
       await bot.deleteMessage(chatId, processingMsg.message_id);
     } catch { /* ignore */ }
 
-    await bot.sendMessage(chatId, buildReport(results), {
-      parse_mode: "Markdown",
-    });
+    await bot.sendMessage(chatId, buildReport(results), { parse_mode: "Markdown" });
   });
 
-  // ── Regular messages — collect QR entries ──────────────────────────────
+  // ── Regular messages — collect QR entries with debounced ack ─────────────
+  // When 100 messages arrive at once, we DON'T reply to each one.
+  // Instead we wait ACK_DEBOUNCE_MS after the last message, then send one reply.
   bot.on("message", async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text || msg.caption || "";
     const entities = msg.entities || msg.caption_entities || [];
 
-    // Ignore commands (handled above)
     if (text.startsWith("/")) return;
     if (!text.trim()) return;
-
-    // Only process messages containing QR entries
     if (!/QR\s*#\d+/i.test(text)) return;
 
     const newEntries = parseQREntries(text, entities);
@@ -313,14 +368,26 @@ export function startBot(): void {
     // Deduplicate by QR number
     const existingNums = new Set(session.entries.map((e) => e.qrNumber));
     const added = newEntries.filter((e) => !existingNums.has(e.qrNumber));
-    session.entries.push(...added);
+    if (added.length === 0) return;
 
-    const total = session.entries.length;
-    await bot.sendMessage(
-      chatId,
-      `➕ *${added.length} QR entr${added.length === 1 ? "y" : "ies"} added* — Total in queue: *${total}*\n\nSend more, or type /done to check all of them now\\.`,
-      { parse_mode: "MarkdownV2" },
-    );
+    session.entries.push(...added);
+    session.pendingAckCount += added.length;
+
+    // Reset the debounce timer — only fires after messages stop arriving
+    if (session.ackTimer) clearTimeout(session.ackTimer);
+
+    session.ackTimer = setTimeout(async () => {
+      const acked = session.pendingAckCount;
+      session.pendingAckCount = 0;
+      session.ackTimer = null;
+      const total = session.entries.length;
+
+      await bot.sendMessage(
+        chatId,
+        `➕ *${acked} QR entr${acked === 1 ? "y" : "ies"} added* — Queue: *${total}* total\n\nSend more, or type /done to check all of them now\\.`,
+        { parse_mode: "MarkdownV2" },
+      ).catch((err: unknown) => logger.warn({ err }, "Failed to send ack"));
+    }, ACK_DEBOUNCE_MS);
   });
 
   bot.on("polling_error", (err) => {
