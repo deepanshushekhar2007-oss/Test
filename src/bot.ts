@@ -161,36 +161,67 @@ function buildReport(results: QRResult[]): string {
   const noLink   = results.filter((r) => r.status === "nolink");
 
   const lines: string[] = [];
-  lines.push(`📋 *Payment Verification Report*`);
+  lines.push(`🧾 *UPI QR Payment Report*`);
   lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
   if (verified.length > 0) {
-    lines.push(`\n✅ *VERIFIED (${verified.length})*`);
-    verified.forEach((r) => lines.push(`  • QR #${r.qrNumber}`));
+    lines.push(`\n✅ *VERIFIED — ${verified.length} QR(s)*`);
+    verified.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
   }
 
   if (expired.length > 0) {
-    lines.push(`\n❌ *EXPIRED (${expired.length})*`);
-    expired.forEach((r) => lines.push(`  • QR #${r.qrNumber}`));
+    lines.push(`\n❌ *EXPIRED — ${expired.length} QR(s)*`);
+    expired.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
   }
 
   if (unknown.length > 0) {
-    lines.push(`\n❓ *UNKNOWN / PENDING (${unknown.length})*`);
-    unknown.forEach((r) => lines.push(`  • QR #${r.qrNumber}`));
+    lines.push(`\n❓ *PENDING / UNKNOWN — ${unknown.length} QR(s)*`);
+    unknown.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
   }
 
   if (noLink.length > 0) {
-    lines.push(`\n⚠️ *LINK NAHI MILA (${noLink.length})*`);
-    noLink.forEach((r) => lines.push(`  • QR #${r.qrNumber}`));
+    lines.push(`\n⚠️ *NO LINK FOUND — ${noLink.length} QR(s)*`);
+    noLink.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
   }
 
   lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   lines.push(
-    `📊 *Total: ${results.length}*  |  ✅ Verified: ${verified.length}  |  ❌ Expired: ${expired.length}`,
+    `📊 *Summary*\n` +
+    `  Total Checked : ${results.length}\n` +
+    `  ✅ Verified    : ${verified.length}\n` +
+    `  ❌ Expired     : ${expired.length}\n` +
+    `  ❓ Pending     : ${unknown.length}\n` +
+    `  ⚠️ No Link     : ${noLink.length}`,
   );
 
   return lines.join("\n");
 }
+
+const START_MESSAGE = `
+🤖 *UPI QR Checker Bot*
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Welcome\\! This bot instantly verifies the status of UPI QR payment links using Stripe's API\\.
+
+*📌 What this bot does:*
+• Collects UPI QR payment entries you forward
+• Checks each payment link via Stripe API
+• Reports whether each QR is ✅ Verified, ❌ Expired, ❓ Pending, or ⚠️ Has no link
+
+*🚀 How to use:*
+1\\. Forward or paste messages containing *QR \\#number* entries with payment links
+2\\. Keep sending as many QR messages as you need
+3\\. Type /done when you are finished — the bot will check all of them at once
+4\\. Type /reset at any time to clear the current list and start fresh
+
+*📋 Commands:*
+/start — Show this help message
+/done — Check all collected QR entries
+/reset — Clear the current list and start over
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+👑 *Owner:* @SPIDYWS
+`.trim();
 
 export function startBot(): void {
   if (!TOKEN) return;
@@ -198,14 +229,22 @@ export function startBot(): void {
   const bot = new TelegramBot(TOKEN, { polling: true });
   logger.info("Telegram bot started with polling");
 
+  // ── /start — welcome & help ─────────────────────────────────────────────
+  bot.onText(/^\/start$/i, async (msg) => {
+    const chatId = msg.chat.id;
+    await bot.sendMessage(chatId, START_MESSAGE, {
+      parse_mode: "MarkdownV2",
+    });
+  });
+
   // ── /reset — clear session ──────────────────────────────────────────────
   bot.onText(/^\/reset$/i, async (msg) => {
     const chatId = msg.chat.id;
     sessions.delete(chatId);
     await bot.sendMessage(
       chatId,
-      "🔄 *Reset ho gaya!*\nAb nayi list shuru karo — QRs bhejo aur jab done ho `/done` likho.",
-      { parse_mode: "Markdown" },
+      `🔄 *Session Reset!*\n\nYour QR list has been cleared\\. Send new QR messages and type /done when ready\\.`,
+      { parse_mode: "MarkdownV2" },
     );
   });
 
@@ -217,8 +256,8 @@ export function startBot(): void {
     if (session.entries.length === 0) {
       await bot.sendMessage(
         chatId,
-        "⚠️ Koi QR abhi tak add nahi hua.\nPehle QR messages bhejo, phir `/done` likho.",
-        { parse_mode: "Markdown" },
+        `⚠️ *No QR entries found\\!*\n\nPlease send messages containing QR entries first, then type /done\\.`,
+        { parse_mode: "MarkdownV2" },
       );
       return;
     }
@@ -226,8 +265,8 @@ export function startBot(): void {
     const total = session.entries.length;
     const processingMsg = await bot.sendMessage(
       chatId,
-      `🔄 *${total} QR check ho rahi hain...*\nThoda wait karo ⏳`,
-      { parse_mode: "Markdown" },
+      `⏳ *Checking ${total} QR entr${total === 1 ? "y" : "ies"}\\.\\.\\.*\n\nPlease wait while we verify each payment link\\.`,
+      { parse_mode: "MarkdownV2" },
     );
 
     // Check all in parallel
@@ -279,8 +318,8 @@ export function startBot(): void {
     const total = session.entries.length;
     await bot.sendMessage(
       chatId,
-      `➕ *${added.length} QR add hua* — Total: *${total}*\nAur bhejo, ya /done likho jab sab ho jaye.`,
-      { parse_mode: "Markdown" },
+      `➕ *${added.length} QR entr${added.length === 1 ? "y" : "ies"} added* — Total in queue: *${total}*\n\nSend more, or type /done to check all of them now\\.`,
+      { parse_mode: "MarkdownV2" },
     );
   });
 
