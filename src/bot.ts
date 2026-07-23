@@ -1,4 +1,4 @@
-import TelegramBot from "node-telegram-bot-api";
+import TelegramBot, { MessageEntity } from "node-telegram-bot-api";
 import { logger } from "./lib/logger";
 
 const TOKEN = process.env["TELEGRAM_BOT_TOKEN"];
@@ -12,9 +12,65 @@ interface QREntry {
   paymentUrl: string | null;
 }
 
+interface PaymentLink {
+  url: string;
+  offset: number;
+}
+
+function normalisePaymentUrl(value: string): string | null {
+  const url = value.trim().replace(/[.,!?;:]+$/, "");
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractPaymentLinks(
+  text: string,
+  entities: MessageEntity[],
+): PaymentLink[] {
+  const links: PaymentLink[] = [];
+
+  for (const entity of entities || []) {
+    let rawUrl: string | undefined;
+
+    if (entity.type === "text_link") {
+      rawUrl = entity.url;
+    } else if (entity.type === "url") {
+      // Telegram's `url` entity points at a visible URL in the message.
+      rawUrl = text.slice(entity.offset, entity.offset + entity.length);
+    }
+
+    const url = rawUrl ? normalisePaymentUrl(rawUrl) : null;
+    if (url) links.push({ url, offset: entity.offset });
+  }
+
+  // Some Telegram clients do not provide entities for copied/forwarded text.
+  // Keep a raw-text fallback so visible Stripe payment links are still checked.
+  const rawUrlPattern = /https?:\/\/[^\s<>"']+/gi;
+  let match: RegExpExecArray | null;
+  while ((match = rawUrlPattern.exec(text)) !== null) {
+    const url = normalisePaymentUrl(match[0]);
+    if (url) links.push({ url, offset: match.index });
+  }
+
+  const seen = new Set<string>();
+  return links
+    .sort((a, b) => a.offset - b.offset)
+    .filter((link) => {
+      const key = `${link.offset}:${link.url}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 function parseQREntries(
   text: string,
-  entities: TelegramBot.MessageEntity[],
+  entities: MessageEntity[],
 ): QREntry[] {
   // Flexible pattern: matches "QR #67", "QR67", "QR 67", "QR#67" etc.
   const qrPattern = /QR\s*#?\s*(\d+)/gi;
@@ -26,14 +82,21 @@ function parseQREntries(
 
   if (qrMatches.length === 0) return [];
 
-  const linkEntities = (entities || [])
-    .filter((e) => e.type === "text_link" && e.url)
-    .sort((a, b) => a.offset - b.offset);
+  const paymentLinks = extractPaymentLinks(text, entities);
 
-  return qrMatches.map((qr, i) => ({
-    qrNumber: qr.number,
-    paymentUrl: linkEntities[i]?.url ?? null,
-  }));
+  return qrMatches.map((qr, i) => {
+    const nextQrIndex = qrMatches[i + 1]?.index ?? text.length;
+    const link = paymentLinks.find(
+      (candidate) =>
+        candidate.offset >= qr.index &&
+        candidate.offset < nextQrIndex,
+    );
+
+    return {
+      qrNumber: qr.number,
+      paymentUrl: link?.url ?? null,
+    };
+  });
 }
 
 type PaymentStatus = "verified" | "expired" | "unknown";
@@ -244,7 +307,7 @@ export function startBot(): void {
       params: {
         limit: 100,           // fetch up to 100 updates at once
         timeout: 10,          // long-poll: server holds connection for 10 s
-        allowed_updates: JSON.stringify(["message"]),
+          allowed_updates: ["message"],
       },
     },
   });
