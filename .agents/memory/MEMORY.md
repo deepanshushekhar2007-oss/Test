@@ -1,0 +1,1 @@
+- [GitHub push authentication](github-push-auth.md) — when the GitHub helper lacks connected source-control credentials, use the saved secret with Basic x-access-token authentication for git push.
