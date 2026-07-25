@@ -78,8 +78,14 @@ function parseQREntries(
   const qrPattern = /QR\s*#?\s*(\d+)/gi;
   const qrMatches: { number: string; index: number }[] = [];
   let match: RegExpExecArray | null;
+
+  // Only count QR matches that are NOT inside a URL (Stripe base64 tokens
+  // can contain substrings like "qR0" that would otherwise false-positive).
+  const urlSpans = getUrlSpans(text, entities);
   while ((match = qrPattern.exec(text)) !== null) {
-    qrMatches.push({ number: match[1]!, index: match.index });
+    if (!insideUrl(match.index, urlSpans)) {
+      qrMatches.push({ number: match[1]!, index: match.index });
+    }
   }
 
   if (qrMatches.length === 0) return [];
@@ -99,6 +105,35 @@ function parseQREntries(
       paymentUrl: link?.url ?? null,
     };
   });
+}
+
+// ── URL-span helpers ─────────────────────────────────────────────────────────
+// Collect character-offset spans of every URL in the message so we can
+// exclude QR-pattern matches that land inside a URL (e.g. Stripe base64
+// tokens can contain substrings like "qR0" that falsely trigger the regex).
+
+interface UrlSpan { start: number; end: number; }
+
+function getUrlSpans(text: string, entities: MessageEntity[]): UrlSpan[] {
+  const spans: UrlSpan[] = [];
+
+  for (const entity of entities || []) {
+    if (entity.type === "url" || entity.type === "text_link") {
+      spans.push({ start: entity.offset, end: entity.offset + entity.length });
+    }
+  }
+
+  const rawUrlPat = /https?:\/\/[^\s<>"']+/gi;
+  let m: RegExpExecArray | null;
+  while ((m = rawUrlPat.exec(text)) !== null) {
+    spans.push({ start: m.index, end: m.index + m[0].length });
+  }
+
+  return spans;
+}
+
+function insideUrl(index: number, spans: UrlSpan[]): boolean {
+  return spans.some((s) => index >= s.start && index < s.end);
 }
 
 // Extract all valid URLs from a message that has NO QR-number pattern.
@@ -483,7 +518,15 @@ export function startBot(): void {
     if (text.startsWith("/")) return;
     if (!text.trim()) return;
 
-    const hasQrNumber = /QR\s*#?\s*\d+/i.test(text);
+    // Check for QR number only in text outside URL spans
+    // (Stripe base64 tokens contain substrings like "qR0" that false-match)
+    const urlSpans     = getUrlSpans(text, entities);
+    const qrCheckPat   = /QR\s*#?\s*\d+/gi;
+    let hasQrNumber    = false;
+    let qrCheckMatch: RegExpExecArray | null;
+    while ((qrCheckMatch = qrCheckPat.exec(text)) !== null) {
+      if (!insideUrl(qrCheckMatch.index, urlSpans)) { hasQrNumber = true; break; }
+    }
 
     let newEntries: QREntry[];
 
