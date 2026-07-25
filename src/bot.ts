@@ -10,6 +10,8 @@ if (!TOKEN) {
 interface QREntry {
   qrNumber: string;
   paymentUrl: string | null;
+  /** true = no QR number in message; auto-numbered row-wise in report */
+  linkOnly?: boolean;
 }
 
 interface PaymentLink {
@@ -97,6 +99,21 @@ function parseQREntries(
       paymentUrl: link?.url ?? null,
     };
   });
+}
+
+// Extract all valid URLs from a message that has NO QR-number pattern.
+// Returns one entry per unique URL found (entity-based + plain-text fallback).
+function parseLinkOnlyEntries(
+  text: string,
+  entities: MessageEntity[],
+): string[] {
+  const links = extractPaymentLinks(text, entities);
+  const seen  = new Set<string>();
+  const out: string[] = [];
+  for (const { url } of links) {
+    if (!seen.has(url)) { seen.add(url); out.push(url); }
+  }
+  return out;
 }
 
 type PaymentStatus = "verified" | "expired" | "unknown";
@@ -189,7 +206,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 type ResultStatus = PaymentStatus | "nolink";
-interface QRResult { qrNumber: string; status: ResultStatus; }
+interface QRResult { qrNumber: string; status: ResultStatus; linkOnly?: boolean; }
 
 // ── Per-chat session ──────────────────────────────────────────────────────────
 interface ChatSession {
@@ -198,6 +215,7 @@ interface ChatSession {
   lastMessageAt: number;    // timestamp of last QR message received
   ackTimer: NodeJS.Timeout | null;
   pendingAckCount: number;
+  linkOnlyCounter: number;  // auto-row counter for link-only entries
 }
 
 const sessions = new Map<number, ChatSession>();
@@ -210,6 +228,7 @@ function getSession(chatId: number): ChatSession {
       lastMessageAt: Date.now(),
       ackTimer: null,
       pendingAckCount: 0,
+      linkOnlyCounter: 0,
     });
   }
   return sessions.get(chatId)!;
@@ -218,6 +237,10 @@ function getSession(chatId: number): ChatSession {
 function buildProgressBar(pct: number): string {
   const filled = Math.round(pct / 10);
   return "█".repeat(filled) + "░".repeat(10 - filled) + ` ${pct}%`;
+}
+
+function entryLabel(r: QRResult): string {
+  return r.linkOnly ? `Link #${r.qrNumber}` : `QR #${r.qrNumber}`;
 }
 
 function buildReport(results: QRResult[]): string {
@@ -231,20 +254,20 @@ function buildReport(results: QRResult[]): string {
   lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
   if (verified.length > 0) {
-    lines.push(`\n✅ *VERIFIED — ${verified.length} QR(s)*`);
-    verified.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
+    lines.push(`\n✅ *VERIFIED — ${verified.length}*`);
+    verified.forEach((r) => lines.push(`  ▸ ${entryLabel(r)}`));
   }
   if (expired.length > 0) {
-    lines.push(`\n❌ *EXPIRED — ${expired.length} QR(s)*`);
-    expired.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
+    lines.push(`\n❌ *EXPIRED — ${expired.length}*`);
+    expired.forEach((r) => lines.push(`  ▸ ${entryLabel(r)}`));
   }
   if (unknown.length > 0) {
-    lines.push(`\n❓ *PENDING / UNKNOWN — ${unknown.length} QR(s)*`);
-    unknown.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
+    lines.push(`\n❓ *PENDING / UNKNOWN — ${unknown.length}*`);
+    unknown.forEach((r) => lines.push(`  ▸ ${entryLabel(r)}`));
   }
   if (noLink.length > 0) {
-    lines.push(`\n⚠️ *NO LINK FOUND — ${noLink.length} QR(s)*`);
-    noLink.forEach((r) => lines.push(`  ▸ QR #${r.qrNumber}`));
+    lines.push(`\n⚠️ *NO LINK FOUND — ${noLink.length}*`);
+    noLink.forEach((r) => lines.push(`  ▸ ${entryLabel(r)}`));
   }
 
   lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
@@ -267,11 +290,12 @@ Welcome\\! This bot verifies UPI QR payment links via Stripe's API\\.
 
 *📌 What this bot does:*
 • Collects UPI QR payment entries you forward
-• Checks each payment link via Stripe API
+• Also accepts plain payment links \\(no QR number needed\\)
+• Checks each link via Stripe API
 • Reports ✅ Verified, ❌ Expired, ❓ Pending, or ⚠️ No Link
 
 *🚀 How to use:*
-1\\. Forward messages containing *QR \\#number* entries with payment links
+1\\. Forward messages with *QR \\#number* entries, or just plain payment links
 2\\. Send as many as you need \\(100\\+ supported\\)
 3\\. Type /done — bot waits for all messages to arrive, then checks them all
 4\\. Type /reset to clear the list and start over
@@ -407,7 +431,7 @@ export function startBot(): void {
 
     if (total === 0) {
       await bot.editMessageText(
-        `⚠️ *No QR entries found\\.*\n\nNo messages with QR numbers were received\\.`,
+        `⚠️ *No entries found\\.*\n\nNo QR numbers or payment links were received\\.`,
         { chat_id: chatId, message_id: collectMsg.message_id, parse_mode: "MarkdownV2" },
       ).catch(() => {});
       return;
@@ -440,7 +464,7 @@ export function startBot(): void {
         ).catch(() => {});
       }
 
-      return { qrNumber: entry.qrNumber, status };
+      return { qrNumber: entry.qrNumber, status, linkOnly: entry.linkOnly };
     });
 
     const results = await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
@@ -450,7 +474,7 @@ export function startBot(): void {
     await bot.sendMessage(chatId, buildReport(results), { parse_mode: "Markdown" });
   });
 
-  // ── Regular messages: collect QR entries ─────────────────────────────────────
+  // ── Regular messages: collect QR entries or plain payment links ───────────────
   bot.on("message", async (msg) => {
     const chatId   = msg.chat.id;
     const text     = msg.text || msg.caption || "";
@@ -458,9 +482,55 @@ export function startBot(): void {
 
     if (text.startsWith("/")) return;
     if (!text.trim()) return;
-    if (!/QR\s*#?\s*\d+/i.test(text)) return;   // matches QR#67, QR 67, QR#67 etc.
 
-    const newEntries = parseQREntries(text, entities);
+    const hasQrNumber = /QR\s*#?\s*\d+/i.test(text);
+
+    let newEntries: QREntry[];
+
+    if (hasQrNumber) {
+      // ── Case 1: Message has QR #number → parse normally ─────────────────────
+      newEntries = parseQREntries(text, entities);
+    } else {
+      // ── Case 2: No QR number → look for payment links only ──────────────────
+      const urls = parseLinkOnlyEntries(text, entities);
+      if (urls.length === 0) return;   // no links → ignore
+
+      const session = getSession(chatId);
+      // Deduplicate by URL across the whole session
+      const existingUrls = new Set(
+        session.entries.filter((e) => e.linkOnly).map((e) => e.paymentUrl),
+      );
+      const freshUrls = urls.filter((u) => !existingUrls.has(u));
+      if (freshUrls.length === 0) return;
+
+      // Assign auto row numbers sequentially
+      newEntries = freshUrls.map((url) => ({
+        qrNumber:   String(++session.linkOnlyCounter),
+        paymentUrl: url,
+        linkOnly:   true,
+      }));
+
+      session.entries.push(...newEntries);
+      session.lastMessageAt = Date.now();
+
+      if (session.donePending) return;
+
+      session.pendingAckCount += newEntries.length;
+      if (session.ackTimer) clearTimeout(session.ackTimer);
+      session.ackTimer = setTimeout(async () => {
+        const acked = session.pendingAckCount;
+        session.pendingAckCount = 0;
+        session.ackTimer = null;
+        const total = session.entries.length;
+        await bot.sendMessage(chatId,
+          `🔗 *${acked} link${acked === 1 ? "" : "s"} added* — Queue: *${total}* total\n\nSend more or type /done to check all now\\.`,
+          { parse_mode: "MarkdownV2" },
+        ).catch((err: unknown) => logger.warn({ err }, "Failed to send ack"));
+      }, ACK_DEBOUNCE_MS);
+      return;
+    }
+
+    // ── Shared path for QR-numbered entries ──────────────────────────────────
     if (newEntries.length === 0) return;
 
     const session = getSession(chatId);
