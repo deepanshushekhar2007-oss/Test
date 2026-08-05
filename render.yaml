@@ -3,7 +3,7 @@ services:
     name: sms-bomber
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn bomber:app
+    startCommand: gunicorn bomber:app --workers 4 --worker-class gevent --timeout 120 --keep-alive 5
     envVars:
       - key: PORT
         value: 10000
